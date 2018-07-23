@@ -5,7 +5,7 @@
 '' * parsing one "construct" (declaration/statement) at a time
 '' * able to recover from parsing errors, by skipping the current construct and
 ''   continuing to the next one. Bad constructs are stored in form
-''   ASTCLASS_UNKNOWN ASTNODEs. Even if all C constructs and gcc extensions
+''   ASTKIND_UNKNOWN ASTNODEs. Even if all C constructs and gcc extensions
 ''   would be supported, this would still be needed for complex #define bodies.
 '' * Recursive declaration parser: can handle multiple declarations in the same
 ''   statement and nested declarations such as function pointers returning
@@ -52,21 +52,12 @@
 '' UDT must be extracted, otherwise it would have to be duplicated too.
 ''
 
-#include once "fbfrog.bi"
+#include once "c-parser.bi"
+#include once "c-common.bi"
 #include once "emit.bi"
+#include once "fbfrog.bi"
 
 using tktokens
-
-declare function cExpression(byval allow_toplevel_comma as integer, byval allow_idseq as integer) as ASTNODE ptr
-declare function cExpressionOrInitializer(byval allow_idseq as integer) as ASTNODE ptr
-declare function cDataType() as ASTNODE ptr
-declare function cDeclaration(byval astclass as integer, byval gccattribs as integer) as ASTNODE ptr
-declare function cScope() as ASTNODE ptr
-declare function cIfBlock() as ASTNODE ptr
-declare function cDoWhile(byval semi_is_optional as integer) as ASTNODE ptr
-declare function cWhile() as ASTNODE ptr
-declare function cConstruct(byval bodyastclass as integer) as ASTNODE ptr
-declare function cBody(byval bodyastclass as integer) as ASTNODE ptr
 
 type DATATYPEINFO
 	id as zstring ptr
@@ -95,78 +86,53 @@ dim shared extradatatypes(0 to ...) as DATATYPEINFO => _
 	(@"wchar_t"  , TYPE_WSTRING )  _
 }
 
-namespace c
-	dim shared api as ApiInfo ptr
-	dim shared as integer x, parseok, tempids
-	dim shared parentdefine as ASTNODE ptr
-
-	dim shared typedefs as THash ptr
-	dim shared extradatatypehash as THash ptr
-
-	'' #pragma pack stack
-	namespace pragmapack
-		const MAXLEVEL = 128
-		dim shared stack(0 to MAXLEVEL-1) as integer
-		dim shared level as integer
-	end namespace
-
-	type DEFBODYNODE
-		xdefbegin	as integer  '' Begin of the #define
-		xbodybegin	as integer  '' Begin of the #define's body
-		n		as ASTNODE ptr  '' #define node
-	end type
-	dim shared defbodies as DEFBODYNODE ptr
-	dim shared as integer defbodycount, defbodyroom
-
-	'' Used by hUpdateTypeNameReferences
-	dim shared as string oldid, newid
-end namespace
-
-private function cMatch(byval tk as integer) as integer
-	if tkGet(c.x) = tk then
-		c.x += 1
+function CParser.match(byval t as integer) as integer
+	if tk->get(x) = t then
+		x += 1
 		function = TRUE
 	end if
 end function
 
-private sub cError(byval message as zstring ptr)
-	if c.parseok then
-		c.parseok = FALSE
+sub CParser.showError(byref message as string)
+	if parseok then
+		parseok = FALSE
 		if frog.verbose then
-			print tkReport(c.x, message)
+			print tk->report(x, message)
 		end if
 	end if
 end sub
 
-private sub cExpectMatch(byval tk as integer, byval message as zstring ptr)
-	if tkGet(c.x) = tk then
-		c.x += 1
-	elseif c.parseok then
-		c.parseok = FALSE
+sub CParser.expectMatch(byval t as integer, byref message as string)
+	if tk->get(x) = t then
+		x += 1
+	elseif parseok then
+		parseok = FALSE
 		if frog.verbose then
-			print tkReport(c.x, tkMakeExpectedMessage(c.x, tkInfoPretty(tk) + " " + *message))
+			print tk->report(x, tk->makeExpectedMessage(x, tkInfoPretty(t) + " " + message))
 		end if
 	end if
 end sub
 
-#define cIsInsideDefineBody() (c.parentdefine <> NULL)
+function CParser.isInsideDefineBody() as integer
+	return (parentdefine <> NULL)
+end function
 
-private sub cResetPragmaPack()
-	c.pragmapack.stack(c.pragmapack.level) = 0
+sub CParser.resetPragmaPack()
+	pragmapack.stack(pragmapack.level) = 0
 end sub
 
-private function cIsTypedef(byval id as zstring ptr) as integer
+function CParser.isTypedef(byval id as zstring ptr) as integer
 	'' 1. Check typedefs seen by C parser
-	if c.typedefs->contains(id, hashHash(id)) then
+	if typedefs.contains(id, hashHash(id)) then
 		return TRUE
 	end if
 
 	'' 2. Check -typedefhint options
-	function = c.api->idopt(OPT_TYPEDEFHINT).matches(id)
+	function = api->idopt(OPT_TYPEDEFHINT).matches(id)
 end function
 
-private function cLookupExtraDataType(byval id as zstring ptr) as integer
-	var item = c.extradatatypehash->lookup(id, hashHash(id))
+function CParser.lookupExtraDataType(byval id as zstring ptr) as integer
+	var item = extradatatypehash.lookup(id, hashHash(id))
 	if item->s then
 		function = cint(item->data)
 	else
@@ -174,116 +140,115 @@ private function cLookupExtraDataType(byval id as zstring ptr) as integer
 	end if
 end function
 
-private function cIdentifierIsMacroParam(byval id as zstring ptr) as integer
-	if c.parentdefine then
-		function = (astLookupMacroParam(c.parentdefine, id) >= 0)
+function CParser.identifierIsMacroParam(byval id as zstring ptr) as integer
+	if parentdefine then
+		function = (parentdefine->lookupMacroParam(id) >= 0)
 	else
 		function = FALSE
 	end if
 end function
 
-sub cInit(byref api as ApiInfo)
-	c.api = @api
-	c.x = 0
-	c.parseok = TRUE
-	c.parentdefine = NULL
-	c.tempids = 0
+constructor CParser(byref tk as TokenBuffer, byref api as ApiInfo)
+	this.tk = @tk
+	this.api = @api
+	x = 0
+	parseok = TRUE
+	parentdefine = NULL
+	tempids = 0
 
-	c.typedefs = new THash(8, FALSE)
-	c.extradatatypehash = new THash(6, FALSE)
 	for i as integer = 0 to ubound(extradatatypes)
-		c.extradatatypehash->addOverwrite(extradatatypes(i).id, cast(any ptr, extradatatypes(i).dtype))
+		extradatatypehash.addOverwrite(extradatatypes(i).id, cast(any ptr, extradatatypes(i).dtype))
 	next
 
 	'' Initially no packing
-	c.pragmapack.level = 0
-	cResetPragmaPack()
+	pragmapack.level = 0
+	resetPragmaPack()
 
-	c.defbodies = NULL
-	c.defbodycount = 0
-	c.defbodyroom = 0
+	defbodies = NULL
+	defbodycount = 0
+	defbodyroom = 0
+end constructor
+
+destructor CParser()
+	deallocate(defbodies)
+end destructor
+
+sub CParser.addTypedef(byval id as const zstring ptr)
+	typedefs.addOverwrite(id, NULL)
 end sub
 
-sub cEnd()
-	deallocate(c.defbodies)
-	delete c.typedefs
-	delete c.extradatatypehash
-end sub
-
-#define cAddTypedef(id) c.typedefs->addOverwrite(id, NULL)
-
-private sub cAddDefBody(byval xdefbegin as integer, byval xbodybegin as integer, byval n as ASTNODE ptr)
-	if c.defbodyroom = c.defbodycount then
-		if c.defbodyroom = 0 then
-			c.defbodyroom = 512
+sub CParser.addDefBody(byval xdefbegin as integer, byval xbodybegin as integer, byval n as AstNode ptr)
+	if defbodyroom = defbodycount then
+		if defbodyroom = 0 then
+			defbodyroom = 512
 		else
-			c.defbodyroom *= 2
+			defbodyroom *= 2
 		end if
-		c.defbodies = reallocate(c.defbodies, c.defbodyroom * sizeof(*c.defbodies))
+		defbodies = reallocate(defbodies, defbodyroom * sizeof(*defbodies))
 	end if
-	with c.defbodies[c.defbodycount]
+	with defbodies[defbodycount]
 		.xdefbegin = xdefbegin
 		.xbodybegin = xbodybegin
 		.n = n
 	end with
-	c.defbodycount += 1
+	defbodycount += 1
 end sub
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-private function cLiteral(byval astclass as integer, byval eval_escapes as integer) as ASTNODE ptr
+function CParser.parseLiteral(byval astkind as integer, byval eval_escapes as integer) as AstNode ptr
 	dim errmsg as string
-	dim n as ASTNODE ptr
+	dim n as AstNode ptr
 
-	if astclass = ASTCLASS_CONSTI then
-		n = hNumberLiteral(c.x, FALSE, errmsg, c.api->clong32)
+	if astkind = ASTKIND_CONSTI then
+		n = hNumberLiteral(*tk, x, FALSE, errmsg, api->clong32)
 	else
-		n = hStringLiteral(c.x, eval_escapes, errmsg)
+		n = hStringLiteral(*tk, x, eval_escapes, errmsg)
 	end if
 
 	if n = NULL then
-		cError(errmsg)
+		showError(errmsg)
 
-		select case astclass
-		case ASTCLASS_CONSTI
-			n = astNew(ASTCLASS_CONSTI, "0")
+		select case astkind
+		case ASTKIND_CONSTI
+			n = astNew(ASTKIND_CONSTI, "0")
 			n->dtype = TYPE_LONG
-		case ASTCLASS_STRING
-			n = astNew(ASTCLASS_STRING, "abc")
+		case ASTKIND_STRING
+			n = astNew(ASTKIND_STRING, "abc")
 			n->dtype = TYPE_ZSTRING
-		case ASTCLASS_CHAR
-			n = astNew(ASTCLASS_CHAR, "0")
+		case ASTKIND_CHAR
+			n = astNew(ASTKIND_CHAR, "0")
 			n->dtype = TYPE_BYTE
 		end select
 	end if
 
-	c.x += 1
+	x += 1
 	function = n
 end function
 
 '' ("..." | [#]id)*
-private function cStringLiteralSequence() as ASTNODE ptr
-	var strcat = astNew(ASTCLASS_STRCAT)
+function CParser.parseStringLiteralSequence() as AstNode ptr
+	var strcat = astNew(ASTKIND_STRCAT)
 
-	while c.parseok
-		select case tkGet(c.x)
+	while parseok
+		select case tk->get(x)
 		case TK_ID
-			astAppend(strcat, astNewTEXT(tkSpellId(c.x)))
-			c.x += 1
+			strcat->append(astNewTEXT(tk->spellId(x)))
+			x += 1
 
 		case TK_STRING, TK_WSTRING
-			astAppend(strcat, cLiteral(ASTCLASS_STRING, TRUE))
+			strcat->append(parseLiteral(ASTKIND_STRING, TRUE))
 
 		'' '#' stringify operator
 		case TK_HASH
 			'' #id?
-			if tkGet(c.x + 1) <> TK_ID then
+			if tk->get(x + 1) <> TK_ID then
 				exit while
 			end if
-			c.x += 1
+			x += 1
 
-			astAppend(strcat, astNew(ASTCLASS_STRINGIFY, astNewTEXT(tkGetText(c.x))))
-			c.x += 1
+			strcat->append(astNew(ASTKIND_STRINGIFY, astNewTEXT(tk->getText(x))))
+			x += 1
 
 		case else
 			exit while
@@ -293,8 +258,8 @@ private function cStringLiteralSequence() as ASTNODE ptr
 	'' Strip the STRCAT node if it's a single literal only...
 	if strcat->head = strcat->tail then
 		var result = strcat->head
-		astUnlink(strcat, strcat->head)
-		astDelete(strcat)
+		strcat->unlink(strcat->head)
+		delete strcat
 		strcat = result
 	end if
 
@@ -327,133 +292,131 @@ end function
 '' make the same mistake, but it doesn't show any warning. That would be crazy
 '' to do for every re-#definable keyword...
 ''
-private function hIsDataType(byval y as integer) as integer
+function CParser.isDataType(byval y as integer) as integer
 	var is_type = FALSE
-
-	select case tkGet(y)
+	select case tk->get(y)
 	case KW_SIGNED, KW_UNSIGNED, KW_CONST, KW_SHORT, KW_LONG, _
 	     KW_ENUM, KW_STRUCT, KW_UNION, _
 	     KW_VOID, KW_CHAR, KW_FLOAT, KW_DOUBLE, KW_INT
-		is_type = not cIdentifierIsMacroParam(tkSpellId(y))
+		is_type = not identifierIsMacroParam(tk->spellId(y))
 	case TK_ID
-		var id = tkSpellId(y)
-		if (cLookupExtraDataType(id) <> TYPE_NONE) or cIsTypedef(id) then
-			is_type = not cIdentifierIsMacroParam(id)
+		var id = tk->spellId(y)
+		if (lookupExtraDataType(id) <> TYPE_NONE) or isTypedef(id) then
+			is_type = not identifierIsMacroParam(id)
 		end if
 	end select
-
 	function = is_type
 end function
 
-private function hIsDataTypeOrAttribute(byval y as integer) as integer
-	select case tkGet(y)
+function CParser.isDataTypeOrAttribute(byval y as integer) as integer
+	select case tk->get(y)
 	case KW___ATTRIBUTE, KW___ATTRIBUTE__
-		function = not cIdentifierIsMacroParam(tkSpellId(y))
+		function = not identifierIsMacroParam(tk->spellId(y))
 	case else
-		function = hIsDataType(y)
+		function = isDataType(y)
 	end select
 end function
 
-private function cCall(byval functionexpr as ASTNODE ptr, byval allow_idseq as integer) as ASTNODE ptr
-	assert(tkGet(c.x) = TK_LPAREN)
-	c.x += 1
+function CParser.parseCall(byval functionexpr as AstNode ptr, byval allow_idseq as integer) as AstNode ptr
+	assert(tk->get(x) = TK_LPAREN)
+	x += 1
 
-	functionexpr = astNew(ASTCLASS_CALL, functionexpr)
+	functionexpr = astNew(ASTKIND_CALL, functionexpr)
 
 	'' [Arguments]
-	if tkGet(c.x) <> TK_RPAREN then
-		'' Expression (',' Expression)*
+	if tk->get(x) <> TK_RPAREN then
+		'' Expr (',' Expr)*
 		do
-			astAppend(functionexpr, cExpression(FALSE, allow_idseq))
+			functionexpr->append(parseExpr(FALSE, allow_idseq))
 
 			'' ','?
-		loop while cMatch(TK_COMMA) and c.parseok
+		loop while match(TK_COMMA) and parseok
 	end if
 
 	'' ')'?
-	cExpectMatch(TK_RPAREN, "to close call argument list")
+	expectMatch(TK_RPAREN, "to close call argument list")
 
 	function = functionexpr
 end function
 
 '' C expression parser based on precedence climbing
-private function hExpression _
+function CParser.parseExprRecursive _
 	( _
 		byval level as integer, _
 		byval parentheses as integer, _
 		byval allow_toplevel_comma as integer, _
 		byval allow_idseq as integer _
-	) as ASTNODE ptr
+	) as AstNode ptr
 
 	'' Unary prefix operators
 	var op = -1
-	select case tkGet(c.x)
-	case TK_EXCL   : op = ASTCLASS_CLOGNOT   '' !
-	case TK_TILDE  : op = ASTCLASS_NOT       '' ~
-	case TK_MINUS  : op = ASTCLASS_NEGATE    '' -
-	case TK_PLUS   : op = ASTCLASS_UNARYPLUS '' +
-	case TK_AMP    : op = ASTCLASS_ADDROF    '' &
-	case TK_STAR   : op = ASTCLASS_DEREF     '' *
+	select case tk->get(x)
+	case TK_EXCL   : op = ASTKIND_CLOGNOT   '' !
+	case TK_TILDE  : op = ASTKIND_NOT       '' ~
+	case TK_MINUS  : op = ASTKIND_NEGATE    '' -
+	case TK_PLUS   : op = ASTKIND_UNARYPLUS '' +
+	case TK_AMP    : op = ASTKIND_ADDROF    '' &
+	case TK_STAR   : op = ASTKIND_DEREF     '' *
 	end select
 
-	dim as ASTNODE ptr a
+	dim as AstNode ptr a
 	if op >= 0 then
-		c.x += 1
-		a = astNew(op, hExpression(cprecedence(op), parentheses, allow_toplevel_comma, allow_idseq))
+		x += 1
+		a = astNew(op, parseExprRecursive(cprecedence(op), parentheses, allow_toplevel_comma, allow_idseq))
 	else
 		'' Atoms
-		select case tkGet(c.x)
+		select case tk->get(x)
 
-		'' '(' Expression ')'
-		'' '(' DataType ')' Expression
+		'' '(' Expr ')'
+		'' '(' DataType ')' Expr
 		'' '(' FunctionTypeExpr ')' '(' ArgumentList ')'
 		case TK_LPAREN
 			'' '('
-			c.x += 1
+			x += 1
 
-			var is_cast = hIsDataTypeOrAttribute(c.x)
+			var is_cast = isDataTypeOrAttribute(x)
 
 			'' Find the ')' and check the token behind it, in some cases
 			'' we can tell that it probably isn't a cast.
-			var closingparen = hFindClosingParen(c.x - 1, cIsInsideDefineBody(), FALSE)
-			select case tkGet(closingparen + 1)
+			var closingparen = tk->findClosingParen(x - 1, isInsideDefineBody(), FALSE)
+			select case tk->get(closingparen + 1)
 			case TK_RPAREN, TK_EOF, TK_EOL
 				is_cast = FALSE
 			end select
 
 			'' Something of the form '(id*)' or just in general a
 			'' '*' in front of the closing ')'? It most likely is a pointer cast.
-			is_cast or= (tkGet(closingparen - 1) = TK_STAR)
+			is_cast or= (tk->get(closingparen - 1) = TK_STAR)
 
 			if is_cast then
 				'' DataType
-				var t = cDataType()
+				var t = parseDataType()
 
 				'' ')'
-				cExpectMatch(TK_RPAREN, "behind the data type")
+				expectMatch(TK_RPAREN, "behind the data type")
 
-				'' Expression
-				a = hExpression(cprecedence(ASTCLASS_CAST), parentheses, allow_toplevel_comma, allow_idseq)
+				'' Expr
+				a = parseExprRecursive(cprecedence(ASTKIND_CAST), parentheses, allow_toplevel_comma, allow_idseq)
 
-				assert(t->class = ASTCLASS_DATATYPE)
-				a = astNew(ASTCLASS_CAST, a)
-				astSetType(a, t->dtype, t->subtype)
-				astDelete(t)
+				assert(t->kind = ASTKIND_DATATYPE)
+				a = astNew(ASTKIND_CAST, a)
+				a->setType(t->dtype, t->subtype)
+				delete t
 			else
-				'' Expression
-				a = hExpression(0, parentheses + 1, allow_toplevel_comma, allow_idseq)
+				'' Expr
+				a = parseExprRecursive(0, parentheses + 1, allow_toplevel_comma, allow_idseq)
 
 				'' ')'
-				cExpectMatch(TK_RPAREN, "to close '(...)' parenthesized expression")
+				expectMatch(TK_RPAREN, "to close '(...)' parenthesized expression")
 
 				if astIsTEXT(a) then
-					if cIdentifierIsMacroParam(a->text) then
+					if identifierIsMacroParam(a->text) then
 						a->attrib or= ASTATTRIB_PARENTHESIZEDMACROPARAM
 					end if
 				end if
 
 				'' '('?
-				if tkGet(c.x) = TK_LPAREN then
+				if tk->get(x) = TK_LPAREN then
 					''
 					'' Function call on parenthesized function name
 					''
@@ -464,165 +427,165 @@ private function hExpression _
 					'' the deref is important?
 					''
 					if astIsTEXT(a) then
-						a = cCall(a, allow_idseq)
+						a = parseCall(a, allow_idseq)
 					end if
 				end if
 			end if
 
 		case TK_NUMBER
-			a = cLiteral(ASTCLASS_CONSTI, TRUE)
+			a = parseLiteral(ASTKIND_CONSTI, TRUE)
 
 		case TK_STRING, TK_WSTRING, TK_HASH
-			a = cStringLiteralSequence()
+			a = parseStringLiteralSequence()
 
 		case TK_CHAR, TK_WCHAR
-			a = cLiteral(ASTCLASS_CHAR, TRUE)
+			a = parseLiteral(ASTKIND_CHAR, TRUE)
 
 		'' Id
 		'' Id '(' ArgumentList ')'
 		'' Id ## Id ## ...
 		'' Id ("String"|Id)*
 		case TK_ID
-			select case tkGet(c.x + 1)
+			select case tk->get(x + 1)
 			'' '('?
 			case TK_LPAREN
-				a = astNewTEXT(tkSpellId(c.x))
-				c.x += 1
+				a = astNewTEXT(tk->spellId(x))
+				x += 1
 
-				a = cCall(a, allow_idseq)
+				a = parseCall(a, allow_idseq)
 
 			'' '##'?
 			case TK_HASHHASH
-				a = astNew(ASTCLASS_PPMERGE)
-				astAppend(a, astNewTEXT(tkSpellId(c.x)))
-				c.x += 2
+				a = astNew(ASTKIND_PPMERGE)
+				a->append(astNewTEXT(tk->spellId(x)))
+				x += 2
 
 				'' Identifier ('##' Identifier)*
 				do
 					'' Identifier?
-					if tkGet(c.x) = TK_ID then
-						astAppend(a, astNewTEXT(tkSpellId(c.x)))
-						c.x += 1
+					if tk->get(x) = TK_ID then
+						a->append(astNewTEXT(tk->spellId(x)))
+						x += 1
 					else
-						cError("expected identifier as operand of '##' PP merge operator" + tkButFound(c.x))
+						showError("expected identifier as operand of '##' PP merge operator" + tk->butFound(x))
 					end if
 
 					'' '##'?
-				loop while cMatch(TK_HASHHASH) and c.parseok
+				loop while match(TK_HASHHASH) and parseok
 
 			case TK_ID
 				'' A B
 				if allow_idseq then
 					'' In a #define body, chances are this is a string literal sequence...
-					a = cStringLiteralSequence()
+					a = parseStringLiteralSequence()
 				else
 					'' But as a statement, this is more likely to be a vardecl, where we
 					'' didn't recognize the A as typedef yet. This shouldn't be misparsed
 					'' as string literal sequence silently, so we parse A as normal expression
 					'' and let B trigger an error.
-					a = astNewTEXT(tkSpellId(c.x))
-					c.x += 1
+					a = astNewTEXT(tk->spellId(x))
+					x += 1
 				end if
 
 			case TK_STRING, TK_WSTRING, TK_HASH
-				a = cStringLiteralSequence()
+				a = parseStringLiteralSequence()
 
 			case else
-				a = astNewTEXT(tkSpellId(c.x))
-				c.x += 1
+				a = astNewTEXT(tk->spellId(x))
+				x += 1
 			end select
 
-		'' SIZEOF Expression
+		'' SIZEOF Expr
 		'' SIZEOF '(' DataType ')'
 		case KW_SIZEOF
-			c.x += 1
+			x += 1
 
 			'' ('(' DataType)?
-			if (tkGet(c.x) = TK_LPAREN) andalso hIsDataTypeOrAttribute(c.x + 1) then
+			if (tk->get(x) = TK_LPAREN) andalso isDataTypeOrAttribute(x + 1) then
 				'' '('
-				c.x += 1
+				x += 1
 
 				'' DataType
-				a = cDataType()
+				a = parseDataType()
 
 				'' ')'
-				cExpectMatch(TK_RPAREN, "behind the data type")
+				expectMatch(TK_RPAREN, "behind the data type")
 			else
-				a = hExpression(cprecedence(ASTCLASS_SIZEOF), parentheses + 1, allow_toplevel_comma, allow_idseq)
+				a = parseExprRecursive(cprecedence(ASTKIND_SIZEOF), parentheses + 1, allow_toplevel_comma, allow_idseq)
 			end if
-			a = astNew(ASTCLASS_SIZEOF, a)
+			a = astNew(ASTKIND_SIZEOF, a)
 
 		'' DEFINED ['('] Identifier [')']
 		case KW_DEFINED
-			c.x += 1
+			x += 1
 
 			'' '('
-			var have_parens = cMatch(TK_LPAREN)
+			var have_parens = match(TK_LPAREN)
 
 			'' Identifier
 			dim as string id
-			if tkGet(c.x) = TK_ID then
-				id = *tkSpellId(c.x)
+			if tk->get(x) = TK_ID then
+				id = *tk->spellId(x)
 			else
-				cError("expected identifier" + tkButFound(c.x))
+				showError("expected identifier" + tk->butFound(x))
 				id = "<error-recovery>"
 			end if
-			a = astNew(ASTCLASS_CDEFINED, id)
-			c.x += 1
+			a = astNew(ASTKIND_CDEFINED, id)
+			x += 1
 
 			if have_parens then
 				'' ')'
-				cExpectMatch(TK_RPAREN, "to finish defined(...) expression")
+				expectMatch(TK_RPAREN, "to finish defined(...) expression")
 			end if
 
 		case else
-			cError("expected expression" + tkButFound(c.x))
-			a = astNew(ASTCLASS_CONSTI, "0")
+			showError("expected expression" + tk->butFound(x))
+			a = astNew(ASTKIND_CONSTI, "0")
 			a->dtype = TYPE_INTEGER
 		end select
 	end if
 
 	'' Infix operators
-	while c.parseok
-		select case as const tkGet(c.x)
-		case TK_QUEST    : op = ASTCLASS_IIF      '' ? (a ? b : c)
-		case TK_PIPEPIPE : op = ASTCLASS_CLOGOR   '' ||
-		case TK_AMPAMP   : op = ASTCLASS_CLOGAND  '' &&
-		case TK_PIPE     : op = ASTCLASS_OR       '' |
-		case TK_PIPEEQ   : op = ASTCLASS_CSELFOR  '' |=
-		case TK_CIRC     : op = ASTCLASS_XOR      '' ^
-		case TK_CIRCEQ   : op = ASTCLASS_CSELFXOR '' ^=
-		case TK_AMP      : op = ASTCLASS_AND      '' &
-		case TK_AMPEQ    : op = ASTCLASS_CSELFAND '' &=
-		case TK_EQ       : op = ASTCLASS_CASSIGN  '' =
-		case TK_EQEQ     : op = ASTCLASS_CEQ      '' ==
-		case TK_EXCLEQ   : op = ASTCLASS_CNE      '' !=
-		case TK_LT       : op = ASTCLASS_CLT      '' <
-		case TK_LTEQ     : op = ASTCLASS_CLE      '' <=
-		case TK_GT       : op = ASTCLASS_CGT      '' >
-		case TK_GTEQ     : op = ASTCLASS_CGE      '' >=
-		case TK_LTLT     : op = ASTCLASS_SHL      '' <<
-		case TK_LTLTEQ   : op = ASTCLASS_CSELFSHL '' <<=
-		case TK_GTGT     : op = ASTCLASS_SHR      '' >>
-		case TK_GTGTEQ   : op = ASTCLASS_CSELFSHR '' >>=
-		case TK_PLUS     : op = ASTCLASS_ADD      '' +
-		case TK_PLUSEQ   : op = ASTCLASS_CSELFADD '' +=
-		case TK_MINUS    : op = ASTCLASS_SUB      '' -
-		case TK_MINUSEQ  : op = ASTCLASS_CSELFSUB '' -=
-		case TK_STAR     : op = ASTCLASS_MUL      '' *
-		case TK_STAREQ   : op = ASTCLASS_CSELFMUL '' *=
-		case TK_SLASH    : op = ASTCLASS_DIV      '' /
-		case TK_SLASHEQ  : op = ASTCLASS_CSELFDIV '' /=
-		case TK_PERCENT  : op = ASTCLASS_MOD      '' %
-		case TK_PERCENTEQ : op = ASTCLASS_CSELFMOD '' %=
-		case TK_LBRACKET : op = ASTCLASS_INDEX    '' [ ... ]
-		case TK_DOT      : op = ASTCLASS_MEMBER   '' .
-		case TK_ARROW    : op = ASTCLASS_MEMBERDEREF '' ->
+	while parseok
+		select case as const tk->get(x)
+		case TK_QUEST    : op = ASTKIND_IIF      '' ? (a ? b : c)
+		case TK_PIPEPIPE : op = ASTKIND_CLOGOR   '' ||
+		case TK_AMPAMP   : op = ASTKIND_CLOGAND  '' &&
+		case TK_PIPE     : op = ASTKIND_OR       '' |
+		case TK_PIPEEQ   : op = ASTKIND_CSELFOR  '' |=
+		case TK_CIRC     : op = ASTKIND_XOR      '' ^
+		case TK_CIRCEQ   : op = ASTKIND_CSELFXOR '' ^=
+		case TK_AMP      : op = ASTKIND_AND      '' &
+		case TK_AMPEQ    : op = ASTKIND_CSELFAND '' &=
+		case TK_EQ       : op = ASTKIND_CASSIGN  '' =
+		case TK_EQEQ     : op = ASTKIND_CEQ      '' ==
+		case TK_EXCLEQ   : op = ASTKIND_CNE      '' !=
+		case TK_LT       : op = ASTKIND_CLT      '' <
+		case TK_LTEQ     : op = ASTKIND_CLE      '' <=
+		case TK_GT       : op = ASTKIND_CGT      '' >
+		case TK_GTEQ     : op = ASTKIND_CGE      '' >=
+		case TK_LTLT     : op = ASTKIND_SHL      '' <<
+		case TK_LTLTEQ   : op = ASTKIND_CSELFSHL '' <<=
+		case TK_GTGT     : op = ASTKIND_SHR      '' >>
+		case TK_GTGTEQ   : op = ASTKIND_CSELFSHR '' >>=
+		case TK_PLUS     : op = ASTKIND_ADD      '' +
+		case TK_PLUSEQ   : op = ASTKIND_CSELFADD '' +=
+		case TK_MINUS    : op = ASTKIND_SUB      '' -
+		case TK_MINUSEQ  : op = ASTKIND_CSELFSUB '' -=
+		case TK_STAR     : op = ASTKIND_MUL      '' *
+		case TK_STAREQ   : op = ASTKIND_CSELFMUL '' *=
+		case TK_SLASH    : op = ASTKIND_DIV      '' /
+		case TK_SLASHEQ  : op = ASTKIND_CSELFDIV '' /=
+		case TK_PERCENT  : op = ASTKIND_MOD      '' %
+		case TK_PERCENTEQ : op = ASTKIND_CSELFMOD '' %=
+		case TK_LBRACKET : op = ASTKIND_INDEX    '' [ ... ]
+		case TK_DOT      : op = ASTKIND_MEMBER   '' .
+		case TK_ARROW    : op = ASTKIND_MEMBERDEREF '' ->
 		case TK_COMMA  '' ,
 			if (parentheses = 0) and (not allow_toplevel_comma) then
 				exit while
 			end if
-			op = ASTCLASS_CCOMMA
+			op = ASTKIND_CCOMMA
 		case else
 			exit while
 		end select
@@ -640,27 +603,27 @@ private function hExpression _
 		end if
 
 		'' For [] we parse until the ], no precedence levels needed
-		if op = ASTCLASS_INDEX then
+		if op = ASTKIND_INDEX then
 			oplevel = 0
 		end if
 
 		'' operator
-		c.x += 1
+		x += 1
 
 		'' rhs
-		var b = hExpression(oplevel, parentheses + iif(op = ASTCLASS_INDEX, 1, 0), allow_toplevel_comma, allow_idseq)
+		var b = parseExprRecursive(oplevel, parentheses + iif(op = ASTKIND_INDEX, 1, 0), allow_toplevel_comma, allow_idseq)
 
 		'' Handle ?: special case
-		if op = ASTCLASS_IIF then
+		if op = ASTKIND_IIF then
 			'' ':'
-			cExpectMatch(TK_COLON, "for a?b:c iif operator")
+			expectMatch(TK_COLON, "for a?b:c iif operator")
 
-			a = astNewIIF(a, b, hExpression(oplevel, parentheses, allow_toplevel_comma, allow_idseq))
+			a = astNewIIF(a, b, parseExprRecursive(oplevel, parentheses, allow_toplevel_comma, allow_idseq))
 		else
 			'' Handle [] special case
-			if op = ASTCLASS_INDEX then
+			if op = ASTKIND_INDEX then
 				'' ']'
-				cExpectMatch(TK_RBRACKET, "for [] indexing operator")
+				expectMatch(TK_RBRACKET, "for [] indexing operator")
 			end if
 
 			a = astNew(op, a, b)
@@ -670,63 +633,65 @@ private function hExpression _
 	function = a
 end function
 
-private function cExpression(byval allow_toplevel_comma as integer, byval allow_idseq as integer) as ASTNODE ptr
-	function = hExpression(0, 0, allow_toplevel_comma, allow_idseq)
+function CParser.parseExpr(byval allow_toplevel_comma as integer, byval allow_idseq as integer) as AstNode ptr
+	function = parseExprRecursive(0, 0, allow_toplevel_comma, allow_idseq)
 end function
 
-'' Initializer:
-'' '{' ExpressionOrInitializer (',' ExpressionOrInitializer)* [','] '}'
-private function cInitializer(byval allow_idseq as integer) as ASTNODE ptr
+'' Init:
+'' '{' ExprOrInit (',' ExprOrInit)* [','] '}'
+function CParser.parseInit(byval allow_idseq as integer) as AstNode ptr
 	'' '{'
-	assert(tkGet(c.x) = TK_LBRACE)
-	c.x += 1
+	assert(tk->get(x) = TK_LBRACE)
+	x += 1
 
-	var a = astNew(ASTCLASS_STRUCTINIT)
+	var a = astNew(ASTKIND_STRUCTINIT)
 
 	do
 		'' '}'?
-		if tkGet(c.x) = TK_RBRACE then exit do
+		if tk->get(x) = TK_RBRACE then
+			exit do
+		end if
 
-		astAppend(a, cExpressionOrInitializer(allow_idseq))
+		a->append(parseExprOrInit(allow_idseq))
 
 		'' ','
-	loop while cMatch(TK_COMMA) and c.parseok
+	loop while match(TK_COMMA) and parseok
 
-	cExpectMatch(TK_RBRACE, "to close initializer")
+	expectMatch(TK_RBRACE, "to close initializer")
 
 	function = a
 end function
 
-private function cExpressionOrInitializer(byval allow_idseq as integer) as ASTNODE ptr
+function CParser.parseExprOrInit(byval allow_idseq as integer) as AstNode ptr
 	'' '{'?
-	if tkGet(c.x) = TK_LBRACE then
-		function = cInitializer(allow_idseq)
+	if tk->get(x) = TK_LBRACE then
+		function = parseInit(allow_idseq)
 	else
-		function = cExpression(FALSE, allow_idseq)
+		function = parseExpr(FALSE, allow_idseq)
 	end if
 end function
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-private sub cSkipToCommaOrRparen()
+sub CParser.skipToCommaOrRparen()
 	do
-		select case tkGet(c.x)
+		select case tk->get(x)
 		case TK_LPAREN, TK_LBRACKET, TK_LBRACE
-			c.x = hFindClosingParen(c.x, cIsInsideDefineBody(), TRUE)
+			x = tk->findClosingParen(x, isInsideDefineBody(), TRUE)
 		case TK_COMMA, TK_RPAREN, TK_EOF
 			exit do
 		end select
-		c.x += 1
+		x += 1
 	loop
 end sub
 
-private sub cGccAttribute(byref gccattribs as integer)
-	if tkGet(c.x) < TK_ID then
-		cError("expected attribute identifier inside __attribute__((...))")
+sub CParser.parseGccAttribute(byref gccattribs as integer)
+	if tk->get(x) < TK_ID then
+		showError("expected attribute identifier inside __attribute__((...))")
 		exit sub
 	end if
 
-	var attr = *tkSpellId(c.x)
+	var attr = *tk->spellId(x)
 
 	'' Each attribute can be given as foo or __foo__ -- normalize to foo.
 	if (left(attr, 2) = "__") and (right(attr, 2) = "__") then
@@ -759,54 +724,54 @@ private sub cGccAttribute(byref gccattribs as integer)
 	     "visibility", _
 	     "warn_unused_result", _
 	     "dllexport"  '' used on declarations in some headers (SDL 1.2), looks like gcc ignores it
-		c.x += 1
+		x += 1
 
 		'' Some of these attributes accept further arguments which we
 		'' can just ignore.
-		cSkipToCommaOrRparen()
+		skipToCommaOrRparen()
 
-	case "cdecl"     : gccattribs or= ASTATTRIB_CDECL     : c.x += 1
-	case "stdcall"   : gccattribs or= ASTATTRIB_STDCALL   : c.x += 1
-	case "packed"    : gccattribs or= ASTATTRIB_PACKED    : c.x += 1
-	case "dllimport" : gccattribs or= ASTATTRIB_DLLIMPORT : c.x += 1
+	case "cdecl"     : gccattribs or= ASTATTRIB_CDECL     : x += 1
+	case "stdcall"   : gccattribs or= ASTATTRIB_STDCALL   : x += 1
+	case "packed"    : gccattribs or= ASTATTRIB_PACKED    : x += 1
+	case "dllimport" : gccattribs or= ASTATTRIB_DLLIMPORT : x += 1
 	case else
-		cError("unknown attribute '" + *tkSpellId(c.x) + "'")
+		showError("unknown attribute '" + *tk->spellId(x) + "'")
 	end select
 end sub
 
-private sub cGccAttributeList(byref gccattribs as integer)
-	while c.parseok
-		select case tkGet(c.x)
+sub CParser.parseGccAttributeList(byref gccattribs as integer)
+	while parseok
+		select case tk->get(x)
 		case KW_VOLATILE, KW_INLINE, KW___INLINE, KW___INLINE__
-			c.x += 1
+			x += 1
 
 		'' __attribute__((...)):
 		'' __ATTRIBUTE__ '((' Attribute (',' Attribute)* '))'
 		case KW___ATTRIBUTE, KW___ATTRIBUTE__
-			c.x += 1
+			x += 1
 
 			'' '('?
-			cExpectMatch(TK_LPAREN, "as 1st '(' in '__attribute__((...))'")
+			expectMatch(TK_LPAREN, "as 1st '(' in '__attribute__((...))'")
 
 			'' '('?
-			cExpectMatch(TK_LPAREN, "as 2nd '(' in '__attribute__((...))'")
+			expectMatch(TK_LPAREN, "as 2nd '(' in '__attribute__((...))'")
 
 			'' Attribute (',' Attribute)*
 			do
 				'' ')'?
-				if tkGet(c.x) = TK_RPAREN then exit do
+				if tk->get(x) = TK_RPAREN then exit do
 
 				'' Attribute
-				cGccAttribute(gccattribs)
+				parseGccAttribute(gccattribs)
 
 				'' ','?
-			loop while cMatch(TK_COMMA) and c.parseok
+			loop while match(TK_COMMA) and parseok
 
 			'' ')'?
-			cExpectMatch(TK_RPAREN, "as 1st ')' in '__attribute__((...))'")
+			expectMatch(TK_RPAREN, "as 1st ')' in '__attribute__((...))'")
 
 			'' ')'?
-			cExpectMatch(TK_RPAREN, "as 2nd ')' in '__attribute__((...))'")
+			expectMatch(TK_RPAREN, "as 2nd ')' in '__attribute__((...))'")
 
 		case else
 			exit while
@@ -816,32 +781,32 @@ end sub
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-'' Enum constant: Identifier ['=' Expression] (',' | '}')
-private function cEnumConst() as ASTNODE ptr
+'' Enum constant: Identifier ['=' Expr] (',' | '}')
+function CParser.parseEnumConst() as AstNode ptr
 	'' Identifier
-	if tkGet(c.x) <> TK_ID then
-		cError("expected identifier for an enum constant" + tkButFound(c.x))
+	if tk->get(x) <> TK_ID then
+		showError("expected identifier for an enum constant" + tk->butFound(x))
 		exit function
 	end if
-	var enumconst = astNew(ASTCLASS_CONST, tkSpellId(c.x))
+	var enumconst = astNew(ASTKIND_CONST, tk->spellId(x))
 	enumconst->attrib or= ASTATTRIB_ENUMCONST
-	c.x += 1
+	x += 1
 
 	'' '='?
-	if cMatch(TK_EQ) then
-		'' Expression
-		enumconst->expr = cExpression(FALSE, FALSE)
+	if match(TK_EQ) then
+		'' Expr
+		enumconst->expr = parseExpr(FALSE, FALSE)
 	end if
 
 	'' (',' | '}')
-	select case tkGet(c.x)
+	select case tk->get(x)
 	case TK_COMMA
-		c.x += 1
+		x += 1
 
 	case TK_RBRACE
 
 	case else
-		cError("expected ',' or '}' behind enum constant" + tkButFound(c.x))
+		showError("expected ',' or '}' behind enum constant" + tk->butFound(x))
 	end select
 
 	function = enumconst
@@ -849,39 +814,39 @@ end function
 
 '' {STRUCT|UNION|ENUM} [Identifier] '{' StructBody|EnumBody '}'
 '' {STRUCT|UNION|ENUM} Identifier
-private function cTag() as ASTNODE ptr
+function CParser.parseTag() as AstNode ptr
 	'' {STRUCT|UNION|ENUM}
-	dim as integer astclass
-	select case tkGet(c.x)
+	dim as integer astkind
+	select case tk->get(x)
 	case KW_UNION
-		astclass = ASTCLASS_UNION
+		astkind = ASTKIND_UNION
 	case KW_ENUM
-		astclass = ASTCLASS_ENUM
+		astkind = ASTKIND_ENUM
 	case else
-		assert(tkGet(c.x) = KW_STRUCT)
-		astclass = ASTCLASS_STRUCT
+		assert(tk->get(x) = KW_STRUCT)
+		astkind = ASTKIND_STRUCT
 	end select
-	c.x += 1
+	x += 1
 
 	'' __attribute__((...))
 	dim gccattrib as integer
-	cGccAttributeList(gccattrib)
+	parseGccAttributeList(gccattrib)
 
 	'' [Identifier]
 	dim tagid as zstring ptr
-	if tkGet(c.x) = TK_ID then
-		tagid = tkSpellId(c.x)
-		c.x += 1
+	if tk->get(x) = TK_ID then
+		tagid = tk->spellId(x)
+		x += 1
 	end if
 
 	'' '{'?
-	if tkGet(c.x) = TK_LBRACE then
-		var udt = astNew(astclass, tagid)
+	if tk->get(x) = TK_LBRACE then
+		var udt = astNew(astkind, tagid)
 		udt->attrib or= gccattrib
 
-		select case astclass
-		case ASTCLASS_STRUCT, ASTCLASS_UNION
-			var maxalign = c.pragmapack.stack(c.pragmapack.level)
+		select case astkind
+		case ASTKIND_STRUCT, ASTKIND_UNION
+			var maxalign = pragmapack.stack(pragmapack.level)
 
 			'' Preserve alignment if needed so we can emit FIELD = N,
 			'' but not if N >= 8, because FB has no alignment > 8,
@@ -893,22 +858,22 @@ private function cTag() as ASTNODE ptr
 		end select
 
 		'' '{'
-		c.x += 1
+		x += 1
 
 		'' Parse struct/union/enum body
-		astAppend(udt, cBody(astclass))
+		udt->append(parseBody(astkind))
 
 		'' '}'
-		cExpectMatch(TK_RBRACE, "to close " + astDumpPrettyDecl(udt) + " block")
+		expectMatch(TK_RBRACE, "to close " + udt->dumpPrettyDecl(false) + " block")
 
 		'' __attribute__((...))
-		cGccAttributeList(udt->attrib)
+		parseGccAttributeList(udt->attrib)
 
 		function = udt
 	else
 		'' It's just a type name, not an UDT body - can't be anonymous
 		if tagid = NULL then
-			cError("expected '{' or tag name" + tkButFound(c.x))
+			showError("expected '{' or tag name" + tk->butFound(x))
 			tagid = @"<error-recovery>"
 		end if
 
@@ -918,21 +883,21 @@ private function cTag() as ASTNODE ptr
 	end if
 end function
 
-private function cTypedef() as ASTNODE ptr
+function CParser.parseTypedef() as AstNode ptr
 	'' TYPEDEF
-	c.x += 1
-	function = cDeclaration(ASTCLASS_TYPEDEF, 0)
+	x += 1
+	function = parseDecl(ASTKIND_TYPEDEF, 0)
 end function
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-private sub hTurnIntoUNKNOWN(byval n as ASTNODE ptr, byval first as integer, byval last as integer)
-	n->class = ASTCLASS_UNKNOWN
-	astSetText(n, tkSpell(first, last))
-	astRemoveChildren(n)
-	astDelete(n->expr)
+sub CParser.turnIntoUNKNOWN(byval n as AstNode ptr, byval first as integer, byval last as integer)
+	n->kind = ASTKIND_UNKNOWN
+	n->setText(tk->spell(first, last))
+	n->removeChildren()
+	delete n->expr
 	n->expr = NULL
-	astSetType(n, TYPE_NONE, NULL)
+	n->setType(TYPE_NONE, NULL)
 end sub
 
 '' Toplevel comma operators can be translated to a sequence of
@@ -947,27 +912,27 @@ end sub
 ''        [return?] c
 ''    end scope
 ''
-private function hUnwrapToplevelCommas(byval n as ASTNODE ptr) as ASTNODE ptr
-	if n->class = ASTCLASS_CCOMMA then
+private function hUnwrapToplevelCommas(byval n as AstNode ptr) as AstNode ptr
+	if n->kind = ASTKIND_CCOMMA then
 		var l = n->head
 		var r = n->tail
-		astUnlink(n, l)
-		astUnlink(n, r)
-		astDelete(n)
+		n->unlink(l)
+		n->unlink(r)
+		delete n
 		function = astNewGROUP(hUnwrapToplevelCommas(l), hUnwrapToplevelCommas(r))
 	else
 		function = n
 	end if
 end function
 
-private sub hHandleToplevelAssign(byval n as ASTNODE ptr)
+private sub hHandleToplevelAssign(byval n as AstNode ptr)
 	'' C assignment expression is top-most expression?
 	'' Can be translated to FB assignment statement easily.
 	'' (unlike C assignments nested deeper in expressions etc.)
 	#macro remap(id)
-		case ASTCLASS_C##id : n->class = ASTCLASS_##id
+		case ASTKIND_C##id : n->kind = ASTKIND_##id
 	#endmacro
-	select case n->class
+	select case n->kind
 	remap(ASSIGN)
 	remap(SELFOR)
 	remap(SELFXOR)
@@ -989,17 +954,17 @@ end sub
 '' use as statement, not expression. (otherwise, for example, assignments could
 '' be mis-used as comparisons)
 ''
-private function hTryToFixCommasAndAssigns(byval n as ASTNODE ptr) as ASTNODE ptr
+private function hTryToFixCommasAndAssigns(byval n as AstNode ptr) as AstNode ptr
 	'' Commas (first -- in case they contain assignments that will become
 	'' toplevel ones after unwrapping)
 	n = hUnwrapToplevelCommas(n)
 
 	'' Assignments
-	if n->class = ASTCLASS_GROUP then
+	if n->kind = ASTKIND_GROUP then
 		var i = n->head
 		while i
 			hHandleToplevelAssign(i)
-			i = i->next
+			i = i->nxt
 		wend
 	else
 		hHandleToplevelAssign(n)
@@ -1008,12 +973,12 @@ private function hTryToFixCommasAndAssigns(byval n as ASTNODE ptr) as ASTNODE pt
 	function = n
 end function
 
-private sub hErrorForRemainingCommasOrAssigns(byval n as ASTNODE ptr)
-	if astContains(n, ASTCLASS_CCOMMA) then
-		cError("can't auto-translate C comma operator here [yet]")
+sub CParser.showErrorForRemainingCommasOrAssigns(byval n as AstNode ptr)
+	if n->contains(ASTKIND_CCOMMA) then
+		showError("can't auto-translate C comma operator here [yet]")
 	end if
-	if astContainsCAssignments(n) then
-		cError("can't auto-translate C assignment operator here [yet]")
+	if n->containsCAssignments() then
+		showError("can't auto-translate C assignment operator here [yet]")
 	end if
 end sub
 
@@ -1027,14 +992,14 @@ end sub
 '' order to support "{ int a, b; }", we have to scan the whole '{...}' block
 '' for ';'s.
 ''
-private function hDefineBodyLooksLikeScopeBlock(byval x as integer) as integer
+function CParser.defineBodyLooksLikeScopeBlock(byval y as integer) as integer
 	'' '{'
-	assert(tkGet(x) = TK_LBRACE)
-	x += 1
+	assert(tk->get(y) = TK_LBRACE)
+	y += 1
 
 	'' Any keyword? (then it's likely not an expression, as most C keywords
 	'' are for statements...)
-	select case tkGet(x)
+	select case tk->get(y)
 	case KW_SIZEOF
 		'' sizeof() is an exception: a keyword, but for expressions, not statements
 	case is > TK_ID
@@ -1042,7 +1007,7 @@ private function hDefineBodyLooksLikeScopeBlock(byval x as integer) as integer
 	end select
 
 	do
-		select case tkGet(x)
+		select case tk->get(y)
 		case TK_SEMI
 			return TRUE
 
@@ -1050,54 +1015,54 @@ private function hDefineBodyLooksLikeScopeBlock(byval x as integer) as integer
 			exit do
 
 		case TK_LPAREN, TK_LBRACKET, TK_LBRACE
-			x = hFindClosingParen(x, TRUE, TRUE)
+			y = tk->findClosingParen(y, TRUE, TRUE)
 		end select
 
-		x += 1
+		y += 1
 	loop
 
 	function = FALSE
 end function
 
-private function cDefineBodyTokenLiteral() as string
-	dim astclass as integer
-	select case as const tkGet(c.x)
-	case TK_NUMBER             : astclass = ASTCLASS_CONSTI
-	case TK_STRING, TK_WSTRING : astclass = ASTCLASS_STRING
-	case TK_CHAR, TK_WCHAR     : astclass = ASTCLASS_CHAR
+function CParser.parseDefineBodyTokenLiteral() as string
+	dim astkind as integer
+	select case as const tk->get(x)
+	case TK_NUMBER             : astkind = ASTKIND_CONSTI
+	case TK_STRING, TK_WSTRING : astkind = ASTKIND_STRING
+	case TK_CHAR, TK_WCHAR     : astkind = ASTKIND_CHAR
 	case else : assert(FALSE)
 	end select
-	var n = cLiteral(astclass, TRUE)
+	var n = parseLiteral(astkind, TRUE)
 	function = emitFbExpr(n)
-	astDelete(n)
+	delete n
 end function
 
-private function cDefineBodyToken() as string
-	select case as const tkGet(c.x)
+function CParser.parseDefineBodyToken() as string
+	select case as const tk->get(x)
 	case TK_NUMBER, TK_STRING, TK_WSTRING, TK_CHAR, TK_WCHAR
-		function = cDefineBodyTokenLiteral()
+		function = parseDefineBodyTokenLiteral()
 
-	case TK_EXCLEQ    : function = "<>"      : c.x += 1  '' !=
-	case TK_PERCENT   : function = "mod"     : c.x += 1  '' %
-	case TK_PERCENTEQ : function = "mod="    : c.x += 1  '' %=
-	case TK_AMP       : function = "and"     : c.x += 1  '' &
-	case TK_AMPEQ     : function = "and="    : c.x += 1  '' &=
-	case TK_AMPAMP    : function = "andalso" : c.x += 1  '' &&
-	case TK_LTLT      : function = "shl"     : c.x += 1  '' <<
-	case TK_LTLTEQ    : function = "shl="    : c.x += 1  '' <<=
-	case TK_EQEQ      : function = "="       : c.x += 1  '' ==
-	case TK_GTGT      : function = "shr"     : c.x += 1  '' >>
-	case TK_GTGTEQ    : function = "shr="    : c.x += 1  '' >>=
-	case TK_CIRC      : function = "xor"     : c.x += 1  '' ^
-	case TK_CIRCEQ    : function = "xor="    : c.x += 1  '' ^=
-	case TK_PIPE      : function = "or"      : c.x += 1  '' |
-	case TK_PIPEEQ    : function = "or="     : c.x += 1  '' |=
-	case TK_PIPEPIPE  : function = "orelse"  : c.x += 1  '' ||
-	case TK_TILDE     : function = "not"     : c.x += 1  '' ~
+	case TK_EXCLEQ    : function = "<>"      : x += 1  '' !=
+	case TK_PERCENT   : function = "mod"     : x += 1  '' %
+	case TK_PERCENTEQ : function = "mod="    : x += 1  '' %=
+	case TK_AMP       : function = "and"     : x += 1  '' &
+	case TK_AMPEQ     : function = "and="    : x += 1  '' &=
+	case TK_AMPAMP    : function = "andalso" : x += 1  '' &&
+	case TK_LTLT      : function = "shl"     : x += 1  '' <<
+	case TK_LTLTEQ    : function = "shl="    : x += 1  '' <<=
+	case TK_EQEQ      : function = "="       : x += 1  '' ==
+	case TK_GTGT      : function = "shr"     : x += 1  '' >>
+	case TK_GTGTEQ    : function = "shr="    : x += 1  '' >>=
+	case TK_CIRC      : function = "xor"     : x += 1  '' ^
+	case TK_CIRCEQ    : function = "xor="    : x += 1  '' ^=
+	case TK_PIPE      : function = "or"      : x += 1  '' |
+	case TK_PIPEEQ    : function = "or="     : x += 1  '' |=
+	case TK_PIPEPIPE  : function = "orelse"  : x += 1  '' ||
+	case TK_TILDE     : function = "not"     : x += 1  '' ~
 
 	case else
-		function = tkSpell(c.x)
-		c.x += 1
+		function = tk->spell(x)
+		x += 1
 	end select
 end function
 
@@ -1125,119 +1090,119 @@ private function hSeparateBySpace(byval l as integer, byval r as integer) as int
 	function = TRUE
 end function
 
-private function cDefineBodyTokens() as string
+function CParser.parseDefineBodyTokens() as string
 	dim s as string
 
-	var begin = c.x
-	while tkGet(c.x) <> TK_EOL
+	var begin = x
+	while tk->get(x) <> TK_EOL
 
-		assert(tkGet(c.x) <> TK_EOF)
+		assert(tk->get(x) <> TK_EOF)
 
-		if begin < c.x then
-			if hSeparateBySpace(tkGet(c.x - 1), tkGet(c.x)) then
+		if begin < x then
+			if hSeparateBySpace(tk->get(x - 1), tk->get(x)) then
 				s += " "
 			end if
 		end if
 
-		s += cDefineBodyToken()
+		s += parseDefineBodyToken()
 	wend
 
 	function = s
 end function
 
 '' Return value: whether to keep the #define
-private function cDefineBody(byval macro as ASTNODE ptr) as integer
+function CParser.parseDefineBody(byval macro as AstNode ptr) as integer
 	'' If -convbodytokens was given for this #define, then don't try to parse the #define body,
 	'' but just convert the tokens individually from C to FB.
-	if c.api->idopt(OPT_CONVBODYTOKENS).matches(macro->text) then
+	if api->idopt(OPT_CONVBODYTOKENS).matches(macro->text) then
 		'' TODO: should use emit.TokenBuffer, so hlAutoRenameConflictingMacroParams() could work
-		var body = cDefineBodyTokens()
+		var body = parseDefineBodyTokens()
 		if len(body) > 0 then
 			macro->expr = astNewTEXT(body)
 		end if
-		assert(tkGet(c.x) = TK_EOL)
+		assert(tk->get(x) = TK_EOL)
 		return TRUE
 	end if
 
-	select case tkGet(c.x)
+	select case tk->get(x)
 	'' Don't preserve #define if it just contains _Pragma's
 	'' _Pragma("...")
 	case KW__PRAGMA
 		do
 			'' _Pragma
-			c.x += 1
+			x += 1
 
 			'' '('
-			if tkGet(c.x) <> TK_LPAREN then exit do
-			c.x += 1
+			if tk->get(x) <> TK_LPAREN then exit do
+			x += 1
 
 			'' Skip to ')' - we don't care whether there is
 			'' a string literal or something like a #macroparam or similar...
-			cSkipToCommaOrRparen()
-			c.x += 1
-		loop while tkGet(c.x) = KW__PRAGMA
+			skipToCommaOrRparen()
+			x += 1
+		loop while tk->get(x) = KW__PRAGMA
 
 		exit function
 
 	case KW___ATTRIBUTE, KW___ATTRIBUTE__
 		'' Don't preserve #define if it just contains an __attribute__
-		cGccAttributeList(0)
+		parseGccAttributeList(0)
 		exit function
 
 	'' '{'
 	case TK_LBRACE
-		if hDefineBodyLooksLikeScopeBlock(c.x) then
-			macro->expr = cScope()
+		if defineBodyLooksLikeScopeBlock(x) then
+			macro->expr = parseScope()
 		else
-			macro->expr = cInitializer(TRUE)
+			macro->expr = parseInit(TRUE)
 		end if
 		return TRUE
 
 	'' Just a 'const'? It's common to have a #define for the const keyword
 	'' in C headers...
 	case KW_CONST
-		if tkGet(c.x + 1) = TK_EOL then
+		if tk->get(x + 1) = TK_EOL then
 			'' const
-			c.x += 1
+			x += 1
 			exit function
 		end if
 
 	case KW_IF
-		macro->expr = cIfBlock()
+		macro->expr = parseIfBlock()
 		return TRUE
 
 	case KW_DO
-		macro->expr = cDoWhile(TRUE)
+		macro->expr = parseDoWhile(TRUE)
 		return TRUE
 
 	case KW_WHILE
-		macro->expr = cWhile()
+		macro->expr = parseWhile()
 		return TRUE
 	end select
 
-	if hIsDataTypeOrAttribute(c.x) then
-		macro->expr = cDataType()
+	if isDataTypeOrAttribute(x) then
+		macro->expr = parseDataType()
 		return TRUE
 	end if
 
-	macro->expr = hTryToFixCommasAndAssigns(cExpression(FALSE, TRUE))
+	macro->expr = hTryToFixCommasAndAssigns(parseExpr(FALSE, TRUE))
 
-	select case macro->expr->class
-	case ASTCLASS_GROUP, ASTCLASS_ASSIGN, _
-	     ASTCLASS_SELFOR, ASTCLASS_SELFXOR, ASTCLASS_SELFAND, _
-	     ASTCLASS_SELFSHL, ASTCLASS_SELFSHR, _
-	     ASTCLASS_SELFADD, ASTCLASS_SELFSUB, _
-	     ASTCLASS_SELFMUL, ASTCLASS_SELFDIV, ASTCLASS_SELFMOD
-		macro->expr = astNew(ASTCLASS_SCOPEBLOCK, macro->expr)
+	select case macro->expr->kind
+	case ASTKIND_GROUP, ASTKIND_ASSIGN, _
+	     ASTKIND_SELFOR, ASTKIND_SELFXOR, ASTKIND_SELFAND, _
+	     ASTKIND_SELFSHL, ASTKIND_SELFSHR, _
+	     ASTKIND_SELFADD, ASTKIND_SELFSUB, _
+	     ASTKIND_SELFMUL, ASTKIND_SELFDIV, ASTKIND_SELFMOD
+		macro->expr = astNew(ASTKIND_SCOPEBLOCK, macro->expr)
 	end select
 
 	function = TRUE
 end function
 
-private function hDefBodyContainsIds(byval y as integer) as integer
+function CParser.defBodyContainsIds(byval y as integer) as integer
 	do
-		assert(tkGet(y) <> TK_EOF)
-		select case tkGet(y)
+		assert(tk->get(y) <> TK_EOF)
+		select case tk->get(y)
 		case TK_EOL
 			exit do
 		case TK_ID
@@ -1247,178 +1212,178 @@ private function hDefBodyContainsIds(byval y as integer) as integer
 	loop
 end function
 
-private sub cParseDefBody(byval n as ASTNODE ptr, byval xbegin as integer, byref add_to_ast as integer)
-	c.parentdefine = n
+sub CParser.parseDefBody(byval n as AstNode ptr, byval xbegin as integer, byref add_to_ast as integer)
+	parentdefine = n
 
 	'' Body
-	add_to_ast and= cDefineBody(n)
+	add_to_ast and= parseDefineBody(n)
 
 	'' Didn't reach EOL? Then the beginning of the macro body could
 	'' be parsed as expression, but not the rest.
-	assert(tkGet(c.x) <> TK_EOF)
-	if tkGet(c.x) <> TK_EOL then
-		cError("failed to parse full #define body")
-		c.x = hSkipToEol(c.x)
+	assert(tk->get(x) <> TK_EOF)
+	if tk->get(x) <> TK_EOL then
+		showError("failed to parse full #define body")
+		x = tk->skipToEol(x)
 	end if
 
 	if n->expr then
-		hErrorForRemainingCommasOrAssigns(n->expr)
+		showErrorForRemainingCommasOrAssigns(n->expr)
 	end if
 
 	'' If parsing the body failed, turn the PPDEFINE into an UNKNOWN without
 	'' reallocating it (as it may already be linked into the AST).
-	if c.parseok = FALSE then
-		hTurnIntoUNKNOWN(n, xbegin, c.x)
-		c.parseok = TRUE
+	if parseok = FALSE then
+		turnIntoUNKNOWN(n, xbegin, x)
+		parseok = TRUE
 	end if
 
-	c.parentdefine = NULL
+	parentdefine = NULL
 end sub
 
-private function cDefine() as ASTNODE ptr
+function CParser.parseDefine() as AstNode ptr
 	'' define
-	var defbegin = c.x - 1
-	c.x += 1
+	var defbegin = x - 1
+	x += 1
 
 	'' Identifier ['(' ParameterList ')']
-	var macro = hDefineHead(c.x)
+	var macro = hDefineHead(*tk, x)
 
 	'' Body?
 	var add_to_ast = TRUE
 	assert(macro->expr = NULL)
-	if tkGet(c.x) <> TK_EOL then
-		if hDefBodyContainsIds(c.x) then
+	if tk->get(x) <> TK_EOL then
+		if defBodyContainsIds(x) then
 			'' Delay parsing, until we've parsed all declarations in the input.
 			'' This way we have more knowledge about typedefs etc. which could
 			'' help parsing this #define body.
-			cAddDefBody(defbegin, c.x, macro)
-			c.x = hSkipToEol(c.x)
+			addDefBody(defbegin, x, macro)
+			x = tk->skipToEol(x)
 
-			'' cBody() mustn't delete the PPDEFINE node now that
+			'' parseBody() mustn't delete the PPDEFINE node now that
 			'' we're referencing it from the c.defbodies list
-			assert(c.parseok)
+			assert(parseok)
 		else
 			'' Probably a simple #define body, parse right now
-			cParseDefBody(macro, defbegin, add_to_ast)
+			parseDefBody(macro, defbegin, add_to_ast)
 		end if
 	end if
 
 	'' Eol
-	assert(tkGet(c.x) = TK_EOL)
-	c.x += 1
+	assert(tk->get(x) = TK_EOL)
+	x += 1
 
 	if add_to_ast = FALSE then
-		astDelete(macro)
+		delete macro
 		macro = astNewGROUP()
 	end if
 	function = macro
 end function
 
-private function cUndef() as ASTNODE ptr
+function CParser.parseUndef() as AstNode ptr
 	'' undef
-	c.x += 1
+	x += 1
 
 	'' id
-	assert(tkGet(c.x) >= TK_ID)
-	function = astNew(ASTCLASS_UNDEF, tkSpellId(c.x))
-	c.x += 1
+	assert(tk->get(x) >= TK_ID)
+	function = astNew(ASTKIND_UNDEF, tk->spellId(x))
+	x += 1
 
 	'' Eol
-	assert(tkGet(c.x) = TK_EOL)
-	c.x += 1
+	assert(tk->get(x) = TK_EOL)
+	x += 1
 end function
 
-private function cInclude() as ASTNODE ptr
-	c.x += 1
+function CParser.parseInclude() as AstNode ptr
+	x += 1
 
 	'' "filename" | <filename>
 	'' TODO: Don't evaluate escape sequences in "filename"
 	'' TODO: Don't evaluate escape sequences/comments in <filename>
 	dim filename as string
-	if tkGet(c.x) = TK_LT then
+	if tk->get(x) = TK_LT then
 		'' <filename>
 
 		'' Skip tokens until the '>'
-		var begin = c.x
+		var begin = x
 		do
-			c.x += 1
-			assert((tkGet(c.x) <> TK_EOL) and (tkGet(c.x) <> TK_EOF))
-		loop until tkGet(c.x) = TK_GT
+			x += 1
+			assert((tk->get(x) <> TK_EOL) and (tk->get(x) <> TK_EOF))
+		loop until tk->get(x) = TK_GT
 
 		'' Then spell them to get the filename
-		filename = tkSpell(begin + 1, c.x - 1)
-		c.x += 1
+		filename = tk->spell(begin + 1, x - 1)
+		x += 1
 	else
 		'' "filename"
-		assert(tkGet(c.x) = TK_STRING)
-		var s = cLiteral(ASTCLASS_STRING, FALSE)
+		assert(tk->get(x) = TK_STRING)
+		var s = parseLiteral(ASTKIND_STRING, FALSE)
 		filename = *s->text
-		astDelete(s)
+		delete s
 	end if
 
 	'' Eol
-	assert(tkGet(c.x) = TK_EOL)
-	c.x += 1
+	assert(tk->get(x) = TK_EOL)
+	x += 1
 
-	function = astNew(ASTCLASS_PPINCLUDE, filename)
+	function = astNew(ASTKIND_PPINCLUDE, filename)
 end function
 
-private function cPragmaPackNumber() as integer
-	var n = cLiteral(ASTCLASS_CONSTI, TRUE)
-	if n->class <> ASTCLASS_CONSTI then
+function CParser.parsePragmaPackNumber() as integer
+	var n = parseLiteral(ASTKIND_CONSTI, TRUE)
+	if n->kind <> ASTKIND_CONSTI then
 		exit function
 	end if
-	c.pragmapack.stack(c.pragmapack.level) = astEvalConstiAsInt64(n)
-	astDelete(n)
+	pragmapack.stack(pragmapack.level) = n->evalConstiAsInt64()
+	delete n
 	function = TRUE
 end function
 
-private function cPragmaPack() as ASTNODE ptr
+function CParser.parsePragmaPack() as AstNode ptr
 	'' pack
-	assert(tkGet(c.x) = TK_ID)
-	assert(tkSpell(c.x) = "pack")
-	c.x += 1
+	assert(tk->get(x) = TK_ID)
+	assert(tk->spell(x) = "pack")
+	x += 1
 
 	'' '('
-	cExpectMatch(TK_LPAREN, "as in '#pragma pack(...)'")
+	expectMatch(TK_LPAREN, "as in '#pragma pack(...)'")
 
-	select case tkGet(c.x)
+	select case tk->get(x)
 	'' #pragma pack(N): Set max alignment for current top of stack
 	case TK_NUMBER
-		if cPragmaPackNumber() = FALSE then
+		if parsePragmaPackNumber() = FALSE then
 			exit function
 		end if
 
 	'' #pragma pack(push, N)
 	'' #pragma pack(pop)
 	case TK_ID
-		select case *tkSpellId(c.x)
+		select case *tk->spellId(x)
 		case "push"
-			c.pragmapack.level += 1
-			if c.pragmapack.level >= c.pragmapack.MAXLEVEL then
+			pragmapack.level += 1
+			if pragmapack.level >= pragmapack.MAXLEVEL then
 				oops("#pragma pack stack too small")
 			end if
-			cResetPragmaPack()
-			c.x += 1
+			resetPragmaPack()
+			x += 1
 
 			'' ','
-			cExpectMatch(TK_COMMA, "behind 'push'")
+			expectMatch(TK_COMMA, "behind 'push'")
 
 			'' 'N'
-			if tkGet(c.x) <> TK_NUMBER then
+			if tk->get(x) <> TK_NUMBER then
 				exit function
 			end if
-			if cPragmaPackNumber() = FALSE then
+			if parsePragmaPackNumber() = FALSE then
 				exit function
 			end if
 
 		case "pop"
-			if c.pragmapack.level > 0 then
-				c.pragmapack.level -= 1
+			if pragmapack.level > 0 then
+				pragmapack.level -= 1
 			else
-				cError("#pragma pack(pop) without previous push")
+				showError("#pragma pack(pop) without previous push")
 			end if
-			c.x += 1
+			x += 1
 
 		case else
 			exit function
@@ -1426,58 +1391,58 @@ private function cPragmaPack() as ASTNODE ptr
 
 	'' #pragma pack(): Reset top of stack to default
 	case TK_RPAREN
-		cResetPragmaPack()
+		resetPragmaPack()
 
 	case else
 		exit function
 	end select
 
 	'' ')'
-	cExpectMatch(TK_RPAREN, "as in '#pragma pack(...)'")
+	expectMatch(TK_RPAREN, "as in '#pragma pack(...)'")
 
 	'' Eol
-	assert(tkGet(c.x) = TK_EOL)
-	c.x += 1
+	assert(tk->get(x) = TK_EOL)
+	x += 1
 
 	'' Don't preserve the directive
 	function = astNewGROUP()
 end function
 
 '' #pragma comment(lib, "...")
-function cPragmaComment() as ASTNODE ptr
+function CParser.parsePragmaComment() as AstNode ptr
 	'' comment
-	assert(tkGet(c.x) = TK_ID)
-	assert(tkSpell(c.x) = "comment")
-	c.x += 1
+	assert(tk->get(x) = TK_ID)
+	assert(tk->spell(x) = "comment")
+	x += 1
 
 	'' '('
-	assert(tkGet(c.x) = TK_LPAREN)
-	c.x += 1
+	assert(tk->get(x) = TK_LPAREN)
+	x += 1
 
 	'' lib
-	assert(tkGet(c.x) = TK_ID)
-	assert(tkSpell(c.x) = "lib")
-	c.x += 1
+	assert(tk->get(x) = TK_ID)
+	assert(tk->spell(x) = "lib")
+	x += 1
 
 	'' ','
-	assert(tkGet(c.x) = TK_COMMA)
-	c.x += 1
+	assert(tk->get(x) = TK_COMMA)
+	x += 1
 
 	'' "<library-file-name>"
-	assert(tkGet(c.x) = TK_STRING)
+	assert(tk->get(x) = TK_STRING)
 	dim libname as string
 	scope
-		var s = cLiteral(ASTCLASS_STRING, TRUE)
+		var s = parseLiteral(ASTKIND_STRING, TRUE)
 		libname = *s->text
-		astDelete(s)
+		delete s
 	end scope
 
 	'' ')'
-	assert(tkGet(c.x) = TK_RPAREN)
-	c.x += 1
+	assert(tk->get(x) = TK_RPAREN)
+	x += 1
 
-	assert(tkGet(c.x) = TK_EOL)
-	c.x += 1
+	assert(tk->get(x) = TK_EOL)
+	x += 1
 
 	''
 	'' Turn the #pragma comment(lib, "...") into #inclib "..."
@@ -1501,7 +1466,7 @@ function cPragmaComment() as ASTNODE ptr
 		libname = left(libname, len(libname) - 2)
 	end if
 
-	function = astNew(ASTCLASS_INCLIB, libname)
+	function = astNew(ASTKIND_INCLIB, libname)
 end function
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -1536,10 +1501,10 @@ end function
 ''    long long int a;
 ''    const const unsigned long const long const int const unsigned a;
 ''
-private sub cBaseType _
+sub CParser.parseBaseType _
 	( _
 		byref dtype as integer, _
-		byref subtype as ASTNODE ptr, _
+		byref subtype as AstNode ptr, _
 		byref gccattribs as integer, _
 		byref is_tag as integer _
 	)
@@ -1558,20 +1523,20 @@ private sub cBaseType _
 	'' 1. Parse base type and all modifiers, and count them
 	''
 
-	while c.parseok
+	while parseok
 		'' __ATTRIBUTE__((...))
-		cGccAttributeList(gccattribs)
+		parseGccAttributeList(gccattribs)
 
-		select case tkGet(c.x)
+		select case tk->get(x)
 		case KW_SIGNED
 			if unsignedmods > 0 then
-				cError("mixed SIGNED with previous UNSIGNED modifier")
+				showError("mixed SIGNED with previous UNSIGNED modifier")
 			end if
 			signedmods += 1
 
 		case KW_UNSIGNED
 			if signedmods > 0 then
-				cError("mixed UNSIGNED with previous SIGNED modifier")
+				showError("mixed UNSIGNED with previous SIGNED modifier")
 			end if
 			unsignedmods += 1
 
@@ -1580,20 +1545,20 @@ private sub cBaseType _
 
 		case KW_SHORT
 			if longmods > 0 then
-				cError("mixed SHORT with previous LONG modifier")
+				showError("mixed SHORT with previous LONG modifier")
 			end if
 			shortmods += 1
 			if shortmods > 1 then
-				cError("more than 1 SHORT modifier")
+				showError("more than 1 SHORT modifier")
 			end if
 
 		case KW_LONG
 			if shortmods > 0 then
-				cError("mixed LONG with previous SHORT modifier")
+				showError("mixed LONG with previous SHORT modifier")
 			end if
 			longmods += 1
 			if longmods > 2 then
-				cError("more than 2 LONG modifiers")
+				showError("more than 2 LONG modifiers")
 			end if
 
 		case else
@@ -1602,12 +1567,12 @@ private sub cBaseType _
 				exit while
 			end if
 
-			select case tkGet(c.x)
+			select case tk->get(x)
 			case KW_ENUM, KW_STRUCT, KW_UNION
 				dtype = TYPE_UDT
-				subtype = cTag()
+				subtype = parseTag()
 				is_tag = TRUE
-				c.x -= 1
+				x -= 1
 
 			case TK_ID
 				''
@@ -1635,8 +1600,8 @@ private sub cBaseType _
 				end if
 
 				'' Treat the id as the type
-				var id = tkSpellId(c.x)
-				dtype = cLookupExtraDataType(id)
+				var id = tk->spellId(x)
+				dtype = lookupExtraDataType(id)
 				if dtype = TYPE_NONE then
 					dtype = TYPE_UDT
 					subtype = astNewTEXT(id)
@@ -1654,7 +1619,7 @@ private sub cBaseType _
 			end select
 		end select
 
-		c.x += 1
+		x += 1
 	wend
 
 	'' Some details can only be decided after parsing the whole thing,
@@ -1681,7 +1646,7 @@ private sub cBaseType _
 		if shortmods = 1 then
 			dtype = iif(unsignedmods > 0, TYPE_USHORT, TYPE_SHORT)
 		elseif longmods = 1 then
-			dtype = typeGetCLong(unsignedmods > 0, c.api->clong32)
+			dtype = typeGetCLong(unsignedmods > 0, api->clong32)
 		elseif longmods = 2 then
 			dtype = iif(unsignedmods > 0, TYPE_ULONGINT, TYPE_LONGINT)
 		elseif dtype = TYPE_LONG then
@@ -1695,18 +1660,18 @@ private sub cBaseType _
 			dtype = TYPE_LONG
 		else
 			'' No modifiers and no explicit "int" either
-			cError("expected a data type" + tkButFound(c.x))
+			showError("expected a data type" + tk->butFound(x))
 		end if
 	end select
 
 	select case dtype
 	case TYPE_ANY, TYPE_SINGLE, TYPE_DOUBLE, TYPE_UDT
 		if signedmods or unsignedmods or shortmods or longmods then
-			cError("SIGNED|UNSIGNED|SHORT|LONG modifiers used with void/float/double/typedef/UDT")
+			showError("SIGNED|UNSIGNED|SHORT|LONG modifiers used with void/float/double/typedef/UDT")
 		end if
 	case TYPE_ZSTRING, TYPE_BYTE, TYPE_UBYTE
 		if shortmods or longmods then
-			cError("SHORT|LONG modifiers used with CHAR type")
+			showError("SHORT|LONG modifiers used with CHAR type")
 		end if
 	end select
 
@@ -1721,55 +1686,55 @@ private sub cBaseType _
 	end if
 
 	'' __ATTRIBUTE__((...))
-	cGccAttributeList(gccattribs)
+	parseGccAttributeList(gccattribs)
 end sub
 
 '' ParamDeclList = ParamDecl (',' ParamDecl)*
-'' ParamDecl = '...' | Declaration{Param}
-private function cParamDeclList() as ASTNODE ptr
+'' ParamDecl = '...' | Decl{Param}
+function CParser.parseParamDeclList() as AstNode ptr
 	var group = astNewGROUP()
 
 	do
-		dim as ASTNODE ptr t
+		dim as AstNode ptr t
 
 		'' '...'?
-		if tkGet(c.x) = TK_ELLIPSIS then
-			t = astNew(ASTCLASS_PARAM)
-			c.x += 1
+		if tk->get(x) = TK_ELLIPSIS then
+			t = astNew(ASTKIND_PARAM)
+			x += 1
 		else
-			t = cDeclaration(ASTCLASS_PARAM, 0)
+			t = parseDecl(ASTKIND_PARAM, 0)
 		end if
 
-		astAppend(group, t)
+		group->append(t)
 
 		'' ','?
-	loop while cMatch(TK_COMMA) and c.parseok
+	loop while match(TK_COMMA) and parseok
 
 	function = group
 end function
 
-private function hCanHaveInitializer(byval n as ASTNODE ptr) as integer
-	select case n->class
-	case ASTCLASS_PARAM
+private function hCanHaveInit(byval n as AstNode ptr) as integer
+	select case n->kind
+	case ASTKIND_PARAM
 		function = TRUE
-	case ASTCLASS_VAR
+	case ASTKIND_VAR
 		function = ((n->attrib and ASTATTRIB_EXTERN) = 0)
 	end select
 end function
 
-private function hHasVarargParam(byval proc as ASTNODE ptr) as integer
+private function hHasVarargParam(byval proc as AstNode ptr) as integer
 	var param = proc->head
 	while param
 		if param->dtype = TYPE_NONE then
 			return TRUE
 		end if
-		param = param->next
+		param = param->nxt
 	wend
 	function = FALSE
 end function
 
-private sub hPostprocessDeclarator(byval n as ASTNODE ptr)
-	if n->class = ASTCLASS_PROC then
+sub CParser.postprocessDeclarator(byval n as AstNode ptr)
+	if n->kind = ASTKIND_PROC then
 		'' Ignore extern on procedures, not needed explicitly
 		n->attrib and= not ASTATTRIB_EXTERN
 
@@ -1780,7 +1745,7 @@ private sub hPostprocessDeclarator(byval n as ASTNODE ptr)
 		'' And show an error if conflicting attributes were given
 		'' (perhaps we just made a mistake assigning them - better safe...)
 		elseif (n->attrib and ASTATTRIB__CALLCONV) = ASTATTRIB__CALLCONV then
-			cError("cdecl/stdcall attributes specified together")
+			showError("cdecl/stdcall attributes specified together")
 		end if
 
 		'' vararg functions are always cdecl though; explicitly specified
@@ -1794,7 +1759,7 @@ private sub hPostprocessDeclarator(byval n as ASTNODE ptr)
 	end if
 
 	'' Visit procptr subtypes
-	if n->subtype then hPostprocessDeclarator(n->subtype)
+	if n->subtype then postprocessDeclarator(n->subtype)
 end sub
 
 ''
@@ -1804,7 +1769,7 @@ end sub
 ''    ['&']
 ''    { [Identifier] | '(' Declarator ')' }
 ''    { '(' ParamList ')' | ('[' ArrayElements ']')* }
-''    [ '=' Initializer ]
+''    [ '=' Init ]
 ''    GccAttributeList
 ''
 '' This needs to parse things like:
@@ -1822,7 +1787,7 @@ end sub
 ''
 ''
 '' t = The whole declaration's AST. Typically this starts out as a VAR.
-'' node = The ASTNODE at the current recursion level. If we find function
+'' node = The AstNode at the current recursion level. If we find function
 '' parameters or an array size, they go to this node.
 '' If the declarator is a plain VAR, function parameters turn it into a function.
 '' But if it's a pointer, it becomes a function pointer VAR. Then t stays the same,
@@ -1949,17 +1914,17 @@ end sub
 '' Here the stdcall is in the middle declarator and goes to the proc type
 '' corresponding to it, the procptr's result type.
 ''
-private function cDeclarator _
+function CParser.parseDeclarator _
 	( _
 		byval nestlevel as integer, _
-		byval astclass as integer, _
+		byval astkind as integer, _
 		byval outerdtype as integer, _
-		byval basesubtype as ASTNODE ptr, _
+		byval basesubtype as AstNode ptr, _
 		byval basegccattribs as integer, _
-		byref node as ASTNODE ptr, _
+		byref node as AstNode ptr, _
 		byref procptrdtype as integer, _
 		byref gccattribs as integer _
-	) as ASTNODE ptr
+	) as AstNode ptr
 
 	var dtype = outerdtype
 	var innerprocptrdtype = TYPE_PROC
@@ -1980,13 +1945,13 @@ private function cDeclarator _
 	'' or at the front of follow-up declarators in a declaration:
 	''    int f1(void), __attribute__((stdcall)) f2(void);
 	''
-	cGccAttributeList(gccattribs)
+	parseGccAttributeList(gccattribs)
 
 	'' Pointers: ('*')*
-	while cMatch(TK_STAR) and c.parseok
+	while match(TK_STAR) and parseok
 		if (typeGetPtrCount(procptrdtype) = TYPEMAX_PTR) or _
 		   (typeGetPtrCount(dtype       ) = TYPEMAX_PTR) then
-			cError("too many pointers")
+			showError("too many pointers")
 			exit while
 		end if
 
@@ -1994,19 +1959,19 @@ private function cDeclarator _
 		dtype = typeAddrOf(dtype)
 
 		'' (CONST|RESTRICT|__ATTRIBUTE__((...)))*
-		while c.parseok
+		while parseok
 			'' __ATTRIBUTE__((...))
-			cGccAttributeList(gccattribs)
+			parseGccAttributeList(gccattribs)
 
-			select case tkGet(c.x)
+			select case tk->get(x)
 			case KW_CONST
 				procptrdtype = typeSetIsConst(procptrdtype)
 				dtype = typeSetIsConst(dtype)
-				c.x += 1
+				x += 1
 
 			case KW_RESTRICT, KW___RESTRICT, KW___RESTRICT__
 				'' The restrict keyword is not interesting for FB bindings, just ignore
-				c.x += 1
+				x += 1
 
 			case else
 				exit while
@@ -2015,12 +1980,12 @@ private function cDeclarator _
 	wend
 
 	'' Reference: '&'
-	if cMatch(TK_AMP) then
+	if match(TK_AMP) then
 		procptrdtype = typeSetIsRef(procptrdtype)
 		dtype = typeSetIsRef(dtype)
 	end if
 
-	dim as ASTNODE ptr t, innernode
+	dim as AstNode ptr t, innernode
 
 	''    '(' Declarator ')'    |    [Identifier]
 
@@ -2032,86 +1997,86 @@ private function cDeclarator _
 	'' * If it's a parameter list, it can be parenthesized, even multiple
 	''   times. This isn't possible with "normal" function declarations...
 	var paramlistnesting = 0
-	if astclass = ASTCLASS_PARAM then
-		var y = c.x
-		while tkGet(y) = TK_LPAREN
+	if astkind = ASTKIND_PARAM then
+		var y = x
+		while tk->get(y) = TK_LPAREN
 			y += 1
 		wend
-		if hIsDataType(y) or (tkGet(y) = TK_RPAREN) then
-			paramlistnesting = y - c.x
+		if isDataType(y) or (tk->get(y) = TK_RPAREN) then
+			paramlistnesting = y - x
 		end if
 	end if
 
 	'' '(' for declarator?
-	if (tkGet(c.x) = TK_LPAREN) and (paramlistnesting = 0) then
-		c.x += 1
+	if (tk->get(x) = TK_LPAREN) and (paramlistnesting = 0) then
+		x += 1
 
-		t = cDeclarator(nestlevel + 1, astclass, dtype, basesubtype, 0, innernode, innerprocptrdtype, innergccattribs)
+		t = parseDeclarator(nestlevel + 1, astkind, dtype, basesubtype, 0, innernode, innerprocptrdtype, innergccattribs)
 
 		'' ')'
-		cExpectMatch(TK_RPAREN, "for '(...)' parenthesized declarator")
+		expectMatch(TK_RPAREN, "for '(...)' parenthesized declarator")
 	else
 		'' [Identifier]
 		'' An identifier must exist, except for parameters/types, and
 		'' in fact for types there mustn't be an id.
 		dim id as zstring ptr
-		if astclass <> ASTCLASS_DATATYPE then
-			if tkGet(c.x) = TK_ID then
-				id = tkSpellId(c.x)
-				c.x += 1
+		if astkind <> ASTKIND_DATATYPE then
+			if tk->get(x) = TK_ID then
+				id = tk->spellId(x)
+				x += 1
 			else
-				if astclass <> ASTCLASS_PARAM then
-					cError("expected identifier for the symbol declared in this declaration" + tkButFound(c.x))
+				if astkind <> ASTKIND_PARAM then
+					showError("expected identifier for the symbol declared in this declaration" + tk->butFound(x))
 					id = @"<error-recovery>"
 				end if
 			end if
 		end if
 
-		t = astNew(astclass, id)
-		astSetType(t, dtype, basesubtype)
+		t = astNew(astkind, id)
+		t->setType(dtype, basesubtype)
 	end if
 
-	select case tkGet(c.x)
+	select case tk->get(x)
 	'' ('[' [ArrayElements] ']')*
 	case TK_LBRACKET
 		node = t
 
 		'' Can't allow arrays on everything - currently, it's only
 		'' handled for vars/fields/params/typedefs
-		if node->class = ASTCLASS_DATATYPE then
-			cError("TODO: arrays not supported here yet")
+		if node->kind = ASTKIND_DATATYPE then
+			showError("TODO: arrays not supported here yet")
 		end if
 
 		assert(node->array = NULL)
-		node->array = astNew(ASTCLASS_ARRAY)
+		node->array = astNew(ASTKIND_ARRAY)
 
 		'' For each array dimension...
 		do
 			'' '['
-			c.x += 1
+			x += 1
 
-			var d = astNew(ASTCLASS_DIMENSION)
+			var d = astNew(ASTKIND_DIMENSION)
 
 			'' Just '[]'?
-			if tkGet(c.x) = TK_RBRACKET then
-				d->expr = astNew(ASTCLASS_ELLIPSIS)
+			if tk->get(x) = TK_RBRACKET then
+				d->expr = astNew(ASTKIND_ELLIPSIS)
 			else
-				d->expr = cExpression(TRUE, FALSE)
+				d->expr = parseExpr(TRUE, FALSE)
 			end if
 
-			astAppend(node->array, d)
+			node->array->append(d)
 
 			'' ']'
-			cExpectMatch(TK_RBRACKET, "to close this array dimension declaration")
+			expectMatch(TK_RBRACKET, "to close this array dimension declaration")
 
 			'' '['? (next dimension)
-		loop while (tkGet(c.x) = TK_LBRACKET) and c.parseok
+		loop while (tk->get(x) = TK_LBRACKET) and parseok
 
 		if innerprocptrdtype <> TYPE_PROC then
 			'' It's a pointer to an array - unsupported in FB.
 			'' Drop the array type, effectively making it a pointer to just one array element.
 			'' see also expandArrayTypedef()
-			astDelete(node->array)
+			delete node->array
 			node->array = NULL
 		end if
 
@@ -2119,19 +2084,19 @@ private function cDeclarator _
 	case TK_COLON
 		node = t
 
-		if (innerprocptrdtype <> TYPE_PROC) or (node->class <> ASTCLASS_FIELD) then
-			cError("bitfields not supported here")
+		if (innerprocptrdtype <> TYPE_PROC) or (node->kind <> ASTKIND_FIELD) then
+			showError("bitfields not supported here")
 		end if
-		c.x += 1
+		x += 1
 
-		node->bits = cExpression(FALSE, FALSE)
+		node->bits = parseExpr(FALSE, FALSE)
 
 	'' '(' ParamList ')'
 	case TK_LPAREN
 		if paramlistnesting = 0 then
 			paramlistnesting = 1
 		end if
-		c.x += paramlistnesting
+		x += paramlistnesting
 
 		'' Parameters turn a vardecl/fielddecl into a procdecl,
 		'' unless they're for a procptr type.
@@ -2146,47 +2111,47 @@ private function cDeclarator _
 			'' will hold the parameters etc. found at this level.
 
 			'' New PROC node for the function pointer's subtype
-			node = astNew(ASTCLASS_PROC)
-			astSetType(node, dtype, basesubtype)
+			node = astNew(ASTKIND_PROC)
+			node->setType(dtype, basesubtype)
 
 			'' Turn the object into a function pointer
-			astDelete(innernode->subtype)
+			delete innernode->subtype
 			innernode->dtype = innerprocptrdtype
 			innernode->subtype = node
 
 			innerprocptrdtype = TYPE_PROC
 		else
-			select case t->class
+			select case t->kind
 			'' A plain symbol, not a pointer, becomes a function
-			case ASTCLASS_VAR, ASTCLASS_FIELD
+			case ASTKIND_VAR, ASTKIND_FIELD
 				node = t
-				t->class = ASTCLASS_PROC
+				t->kind = ASTKIND_PROC
 
 			'' Anything else though (typedefs, params, type casts...)
 			'' with params isn't turned into a proc, but just has function type.
 			case else
-				node = astNew(ASTCLASS_PROC)
-				astSetType(node, dtype, basesubtype)
+				node = astNew(ASTKIND_PROC)
+				node->setType(dtype, basesubtype)
 
-				astDelete(t->subtype)
+				delete t->subtype
 				t->dtype = TYPE_PROC
 				t->subtype = node
 			end select
 		end if
 
 		'' Just '(void)'?
-		if (tkGet(c.x) = KW_VOID) and (tkGet(c.x + 1) = TK_RPAREN) then
+		if (tk->get(x) = KW_VOID) and (tk->get(x + 1) = TK_RPAREN) then
 			'' VOID
-			c.x += 1
+			x += 1
 		'' Not just '()'?
-		elseif tkGet(c.x) <> TK_RPAREN then
-			assert(node->class = ASTCLASS_PROC)
-			astAppend(node, cParamDeclList())
+		elseif tk->get(x) <> TK_RPAREN then
+			assert(node->kind = ASTKIND_PROC)
+			node->append(parseParamDeclList())
 		end if
 
 		'' ')'
 		while paramlistnesting > 0
-			cExpectMatch(TK_RPAREN, "to close parameter list in function declaration")
+			expectMatch(TK_RPAREN, "to close parameter list in function declaration")
 			paramlistnesting -= 1
 		wend
 	case else
@@ -2195,7 +2160,7 @@ private function cDeclarator _
 
 	'' __ATTRIBUTE__((...))
 	var endgccattribs = 0
-	cGccAttributeList(endgccattribs)
+	parseGccAttributeList(endgccattribs)
 
 	if nestlevel > 0 then
 		'' __attribute__'s from this level should always be passed up
@@ -2207,7 +2172,7 @@ private function cDeclarator _
 			gccattribs or= innergccattribs
 			procptrdtype = typeExpand(innerprocptrdtype, procptrdtype)
 			if procptrdtype = TYPE_NONE then
-				cError("too many pointers, or ref to ref")
+				showError("too many pointers, or ref to ref")
 			end if
 		else
 			node->attrib or= innergccattribs
@@ -2220,8 +2185,8 @@ private function cDeclarator _
 
 		basegccattribs or= gccattribs or endgccattribs
 
-		if (typeGetDt(t->dtype) = TYPE_PROC) and (t->class <> ASTCLASS_PROC) then
-			assert(t->subtype->class = ASTCLASS_PROC)
+		if (typeGetDt(t->dtype) = TYPE_PROC) and (t->kind <> ASTKIND_PROC) then
+			assert(t->subtype->kind = ASTKIND_PROC)
 			t->subtype->attrib or= basegccattribs and ASTATTRIB__CALLCONV
 			t->attrib or= basegccattribs and (not ASTATTRIB__CALLCONV)
 		else
@@ -2233,13 +2198,13 @@ private function cDeclarator _
 		'' dllimport implies extern, and isn't allowed together with static
 		if t->attrib and ASTATTRIB_DLLIMPORT then
 			if t->attrib and ASTATTRIB_STATIC then
-				cError("static dllimport")
+				showError("static dllimport")
 				t->attrib and= not ASTATTRIB_STATIC
 			end if
 			t->attrib or= ASTATTRIB_EXTERN
 		end if
 
-		hPostprocessDeclarator(t)
+		postprocessDeclarator(t)
 	end if
 
 	function = t
@@ -2250,31 +2215,36 @@ end function
 '' Parsing just the base type isn't enough, because it could be a function
 '' pointer cast with parameter list etc. We need to do full declarator parsing
 '' to handle that.
-private function cDataType() as ASTNODE ptr
+function CParser.parseDataType() as AstNode ptr
 	dim as integer dtype, gccattribs
-	dim as ASTNODE ptr subtype
-	cBaseType(dtype, subtype, gccattribs, FALSE)
+	dim as AstNode ptr subtype
+	parseBaseType(dtype, subtype, gccattribs, FALSE)
 
 	'' Disallow UDT bodies in type "expressions" - FB doesn't support it,
 	'' and our highlevel passes/code emitter don't expect it.
 	if subtype then
-		select case subtype->class
-		case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
-			cError("UDT in datatype expression; not supported in FB")
+		select case subtype->kind
+		case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
+			showError("UDT in datatype expression; not supported in FB")
 			dtype = TYPE_INTEGER
-			astDelete(subtype)
+			delete subtype
 			subtype = NULL
 		end select
 	end if
 
-	function = cDeclarator(0, ASTCLASS_DATATYPE, dtype, subtype, gccattribs, NULL, 0, 0)
+	function = parseDeclarator(0, ASTKIND_DATATYPE, dtype, subtype, gccattribs, NULL, 0, 0)
 end function
 
-private function hUpdateTypeNameReferences(byval n as ASTNODE ptr) as integer
-	if typeGetDt(n->dtype) = TYPE_UDT then
-		assert(astIsTEXT(n->subtype))
-		if *n->subtype->text = c.oldid then
-			astSetText(n->subtype, c.newid)
+type TypeNameRefUpdater extends AstVisitor
+	as string oldid, newid
+	declare function visit(byref n as AstNode) as integer override
+end type
+
+function TypeNameRefUpdater.visit(byref n as AstNode) as integer
+	if typeGetDt(n.dtype) = TYPE_UDT then
+		assert(astIsTEXT(n.subtype))
+		if *n.subtype->text = oldid then
+			n.subtype->setText(newid)
 		end if
 	end if
 	function = TRUE
@@ -2288,28 +2258,29 @@ end function
 '' =>
 ''    struct B { };
 ''    struct A { };
-private sub hUnscopeNestedNamedUdts(byval result as ASTNODE ptr, byval udt as ASTNODE ptr)
+private sub hUnscopeNestedNamedUdts(byval result as AstNode ptr, byval udt as AstNode ptr)
 	var i = udt->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
-		select case i->class
-		case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+		select case i->kind
+		case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 			if i->text then
 				if udt->text then
 					'' If the nested UDT was given an auto-generated name,
 					'' prepend the parent UDT name as "namespace".
 					'' All references to the old name must be updated.
 					if i->attrib and ASTATTRIB_GENERATEDID then
-						c.oldid = *i->text
-						c.newid = *udt->text + "_" + *i->text
-						astVisit(udt, @hUpdateTypeNameReferences)
-						astSetText(i, c.newid)
+						dim updater as TypeNameRefUpdater
+						updater.oldid = *i->text
+						updater.newid = *udt->text + "_" + *i->text
+						udt->visit(updater)
+						i->setText(updater.newid)
 					end if
 				end if
 
-				astUnlink(udt, i)
-				astAppend(result, i)
+				udt->unlink(i)
+				result->append(i)
 			end if
 		end select
 
@@ -2327,15 +2298,15 @@ end sub
 ''    int (*procptr)(void);
 ''    struct UDT { int a; };  (special case for BaseType only)
 ''
-'' Declaration = GccAttributeList BaseType Declarator (',' Declarator)* [';']
+'' Decl = GccAttributeList BaseType Declarator (',' Declarator)* [';']
 ''
-private function cDeclaration(byval astclass as integer, byval gccattribs as integer) as ASTNODE ptr
-	assert(astclass <> ASTCLASS_DATATYPE)
+function CParser.parseDecl(byval astkind as integer, byval gccattribs as integer) as AstNode ptr
+	assert(astkind <> ASTKIND_DATATYPE)
 
 	'' BaseType
 	dim as integer dtype, is_tag
-	dim as ASTNODE ptr subtype
-	cBaseType(dtype, subtype, gccattribs, is_tag)
+	dim as AstNode ptr subtype
+	parseBaseType(dtype, subtype, gccattribs, is_tag)
 
 	var result = astNewGROUP()
 
@@ -2343,22 +2314,22 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 	if (typeGetDtAndPtr(dtype) = TYPE_UDT) and is_tag then
 		'' Tag body?
 		''    STRUCT|UNION|ENUM [Identifier] '{' ... '}' ';'
-		select case subtype->class
-		case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+		select case subtype->kind
+		case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 			'' ';'?
-			if cMatch(TK_SEMI) then
+			if match(TK_SEMI) then
 				hUnscopeNestedNamedUdts(result, subtype)
-				astAppend(result, subtype)
+				result->append(subtype)
 				return result
 			end if
 
 		'' Useless tag declaration?
 		''    STRUCT|UNION|ENUM Identifier ';'
-		case ASTCLASS_TEXT
+		case ASTKIND_TEXT
 			'' ';'?
-			if cMatch(TK_SEMI) then
+			if match(TK_SEMI) then
 				'' Ignore & treat as no-op
-				astDelete(subtype)
+				delete subtype
 				return result
 			end if
 		end select
@@ -2370,16 +2341,16 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 	'' Turn the struct/union/enum body into a separate declaration (as
 	'' needed by FB) and make the main declaration reference it by name.
 	if typeGetDtAndPtr(dtype) = TYPE_UDT then
-		select case subtype->class
-		case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+		select case subtype->kind
+		case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 			var udt = subtype
 
 			'' If the UDT is anonymous, we have to generate a name for it.
 			'' (FB doesn't allow anonymous non-nested UDTs)
 			if udt->text = NULL then
 				'' Try to name it after the symbol declared in this declaration
-				if tkGet(c.x) = TK_ID then
-					astSetText(udt, tkSpellId(c.x))
+				if tk->get(x) = TK_ID then
+					udt->setText(tk->spellId(x))
 				else
 					'' Auto-generate id
 					'' TODO:
@@ -2387,8 +2358,8 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 					''  * name after fields (name & type) instead of counter
 					''  * If this is really only needed for anonymous parameters,
 					''    then it's probably very rare in practice. No need to bother.
-					astSetText(udt, "_" + str(c.tempids))
-					c.tempids += 1
+					udt->setText("_" + str(tempids))
+					tempids += 1
 				end if
 				udt->attrib or= ASTATTRIB_GENERATEDID
 			end if
@@ -2397,7 +2368,7 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 			subtype->attrib or= ASTATTRIB_TAGID or (udt->attrib and ASTATTRIB_GENERATEDID)
 
 			hUnscopeNestedNamedUdts(result, udt)
-			astAppend(result, udt)
+			result->append(udt)
 		end select
 	end if
 
@@ -2407,42 +2378,42 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 	var declarator_count = 0
 	do
 		declarator_count += 1
-		var n = cDeclarator(0, astclass, dtype, subtype, gccattribs, NULL, 0, 0)
-		astAppend(result, n)
+		var n = parseDeclarator(0, astkind, dtype, subtype, gccattribs, NULL, 0, 0)
+		result->append(n)
 
-		if n->class = ASTCLASS_TYPEDEF then
+		if n->kind = ASTKIND_TYPEDEF then
 			'' Register known typedefs, so we can disambiguate type casts
-			cAddTypedef(n->text)
+			addTypedef(n->text)
 		end if
 
-		select case tkGet(c.x)
+		select case tk->get(x)
 		case KW_ASM, KW___ASM, KW___ASM__
-			c.x += 1
+			x += 1
 
-			cExpectMatch(TK_LPAREN, "for asm()")
+			expectMatch(TK_LPAREN, "for asm()")
 
-			if tkGet(c.x) = TK_STRING then
-				var s = cLiteral(ASTCLASS_STRING, TRUE)
-				astTakeAliasFromId(n, s)
-				astDelete(s)
+			if tk->get(x) = TK_STRING then
+				var s = parseLiteral(ASTKIND_STRING, TRUE)
+				n->takeAliasFromId(s)
+				delete s
 			else
-				cError("expected ""name"" inside asm()")
+				showError("expected ""name"" inside asm()")
 			end if
 
-			cExpectMatch(TK_RPAREN, "for asm()")
+			expectMatch(TK_RPAREN, "for asm()")
 		end select
 
-		if hCanHaveInitializer(n) then
-			'' ['=' Initializer]
-			if cMatch(TK_EQ) then
+		if hCanHaveInit(n) then
+			'' ['=' Init]
+			if match(TK_EQ) then
 				assert(n->expr = NULL)
-				n->expr = cExpressionOrInitializer(FALSE)
+				n->expr = parseExprOrInit(FALSE)
 
 				'' If it's an array, then it must be an array initializer (or a string literal),
 				'' not a struct initializer
 				if n->array then
-					if n->expr->class = ASTCLASS_STRUCTINIT then
-						n->expr->class = ASTCLASS_ARRAYINIT
+					if n->expr->kind = ASTKIND_STRUCTINIT then
+						n->expr->kind = ASTKIND_ARRAYINIT
 					end if
 				end if
 			end if
@@ -2450,23 +2421,23 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 
 		'' Parameters can't have commas and more identifiers,
 		'' and don't need the ';' either.
-		if n->class = ASTCLASS_PARAM then
+		if n->kind = ASTKIND_PARAM then
 			require_semi = FALSE
 			exit do
 		end if
 
 		'' '{', procedure body?
-		if (n->class = ASTCLASS_PROC) and (tkGet(c.x) = TK_LBRACE) then
+		if (n->kind = ASTKIND_PROC) and (tk->get(x) = TK_LBRACE) then
 			'' A procedure with body must be the first and only
 			'' declarator in the declaration.
 			if declarator_count = 1 then
-				var originalparseok = c.parseok
+				var originalparseok = parseok
 
 				assert(n->expr = NULL)
-				n->expr = cScope()
+				n->expr = parseScope()
 
-				if c.api->nofunctionbodies then
-					c.parseok = originalparseok
+				if api->nofunctionbodies then
+					parseok = originalparseok
 					n->expr = NULL
 				end if
 
@@ -2476,86 +2447,86 @@ private function cDeclaration(byval astclass as integer, byval gccattribs as int
 		end if
 
 		'' ','?
-	loop while cMatch(TK_COMMA) and c.parseok
+	loop while match(TK_COMMA) and parseok
 
 	if require_semi then
 		'' ';'
-		cExpectMatch(TK_SEMI, "to finish this declaration")
+		expectMatch(TK_SEMI, "to finish this declaration")
 	end if
 
-	astDelete(subtype)
+	delete subtype
 	function = result
 end function
 
 '' Variable/procedure declarations
-''    GccAttributeList [EXTERN|STATIC] Declaration
-private function cVarOrProcDecl(byval is_local as integer) as ASTNODE ptr
+''    GccAttributeList [EXTERN|STATIC] Decl
+function CParser.parseVarOrProcDecl(byval is_local as integer) as AstNode ptr
 	'' __ATTRIBUTE__((...))
 	var gccattribs = 0
-	cGccAttributeList(gccattribs)
+	parseGccAttributeList(gccattribs)
 
 	'' [EXTERN|STATIC]
-	select case tkGet(c.x)
+	select case tk->get(x)
 	case KW_EXTERN
 		gccattribs or= ASTATTRIB_EXTERN
-		c.x += 1
+		x += 1
 	case KW_STATIC
 		gccattribs or= ASTATTRIB_STATIC
-		c.x += 1
+		x += 1
 	end select
 
 	if is_local then
 		gccattribs or= ASTATTRIB_LOCAL
 	end if
 
-	'' Declaration. Assume that it's a variable for now; the declarator
+	'' Decl. Assume that it's a variable for now; the declarator
 	'' parser may turn it into a procedure if it has parameters.
-	function = cDeclaration(ASTCLASS_VAR, gccattribs)
+	function = parseDecl(ASTKIND_VAR, gccattribs)
 end function
 
 '' Expression statement: Assignments, function calls, i++, etc.
-private function cExpressionStatement() as ASTNODE ptr
-	function = hTryToFixCommasAndAssigns(cExpression(TRUE, FALSE))
+function CParser.parseExprStatement() as AstNode ptr
+	function = hTryToFixCommasAndAssigns(parseExpr(TRUE, FALSE))
 
 	'' ';'?
-	cExpectMatch(TK_SEMI, "(end of expression statement)")
+	expectMatch(TK_SEMI, "(end of expression statement)")
 end function
 
-'' RETURN [Expression] ';'
-private function cReturn() as ASTNODE ptr
+'' RETURN [Expr] ';'
+function CParser.parseReturn() as AstNode ptr
 	'' RETURN
-	assert(tkGet(c.x) = KW_RETURN)
-	c.x += 1
+	assert(tk->get(x) = KW_RETURN)
+	x += 1
 
-	var n = astNew(ASTCLASS_RETURN)
+	var n = astNew(ASTKIND_RETURN)
 
-	'' [Expression]
-	if tkGet(c.x) <> TK_SEMI then
-		astAppend(n, cExpression(TRUE, FALSE))
+	'' [Expr]
+	if tk->get(x) <> TK_SEMI then
+		n->append(parseExpr(TRUE, FALSE))
 	end if
 
 	'' ';'
-	cExpectMatch(TK_SEMI, "(end of statement)")
+	expectMatch(TK_SEMI, "(end of statement)")
 
 	function = n
 end function
 
 '' '{ ... }' statement block
-'' Using cBody() to allow the constructs in this scope block to be parsed
+'' Using parseBody() to allow the constructs in this scope block to be parsed
 '' separately. If we can't parse one of them, then only that one will become an
 '' unknown construct. The rest of the scope can potentially be parsed fine.
-private function cScope() as ASTNODE ptr
+function CParser.parseScope() as AstNode ptr
 	'' '{'
-	assert(tkGet(c.x) = TK_LBRACE)
-	c.x += 1
+	assert(tk->get(x) = TK_LBRACE)
+	x += 1
 
-	function = astNew(ASTCLASS_SCOPEBLOCK, cBody(ASTCLASS_SCOPEBLOCK))
+	function = astNew(ASTKIND_SCOPEBLOCK, parseBody(ASTKIND_SCOPEBLOCK))
 
 	'' '}'
-	cExpectMatch(TK_RBRACE, "to close compound statement")
+	expectMatch(TK_RBRACE, "to close compound statement")
 end function
 
-private function cConditionExpr() as ASTNODE ptr
+function CParser.parseConditionExpr() as AstNode ptr
 	'' The parentheses around the condition expression are part of the
 	'' if/do/while/... syntax. They have to be parsed explicitly, not as
 	'' part of the condition expression. Otherwise, code such as this:
@@ -2566,265 +2537,265 @@ private function cConditionExpr() as ASTNODE ptr
 	''        ;
 
 	'' '('
-	cExpectMatch(TK_LPAREN, "in front of condition")
+	expectMatch(TK_LPAREN, "in front of condition")
 
 	'' condition expression
-	function = cExpression(TRUE, FALSE)
+	function = parseExpr(TRUE, FALSE)
 
 	'' ')'
-	cExpectMatch(TK_RPAREN, "behind condition")
+	expectMatch(TK_RPAREN, "behind condition")
 end function
 
-'' IF '(' Expression ')' Construct [ELSE Construct]
-private function cIfBlock() as ASTNODE ptr
-	var ifblock = astNew(ASTCLASS_IFBLOCK)
+'' IF '(' Expr ')' Construct [ELSE Construct]
+function CParser.parseIfBlock() as AstNode ptr
+	var ifblock = astNew(ASTKIND_IFBLOCK)
 
 	'' IF
-	assert(tkGet(c.x) = KW_IF)
-	c.x += 1
+	assert(tk->get(x) = KW_IF)
+	x += 1
 
 	'' condition expression
-	var ifpart = astNew(ASTCLASS_IFPART)
-	ifpart->expr = cConditionExpr()
+	var ifpart = astNew(ASTKIND_IFPART)
+	ifpart->expr = parseConditionExpr()
 
 	'' if/true statement
-	astAppend(ifpart, cConstruct(ASTCLASS_SCOPEBLOCK))
-	astAppend(ifblock, ifpart)
+	ifpart->append(parseConstruct(ASTKIND_SCOPEBLOCK))
+	ifblock->append(ifpart)
 
 	'' ELSE?
-	if cMatch(KW_ELSE) then
+	if match(KW_ELSE) then
 		'' else/false statement
-		astAppend(ifblock, astNew(ASTCLASS_ELSEPART, cConstruct(ASTCLASS_SCOPEBLOCK)))
+		ifblock->append(astNew(ASTKIND_ELSEPART, parseConstruct(ASTKIND_SCOPEBLOCK)))
 	end if
 
 	function = ifblock
 end function
 
-'' DO Construct WHILE '(' Expression ')' [';']
-private function cDoWhile(byval semi_is_optional as integer) as ASTNODE ptr
-	var dowhile = astNew(ASTCLASS_DOWHILE)
+'' DO Construct WHILE '(' Expr ')' [';']
+function CParser.parseDoWhile(byval semi_is_optional as integer) as AstNode ptr
+	var dowhile = astNew(ASTKIND_DOWHILE)
 
 	'' DO
-	assert(tkGet(c.x) = KW_DO)
-	c.x += 1
+	assert(tk->get(x) = KW_DO)
+	x += 1
 
 	'' loop body
-	astAppend(dowhile, cConstruct(ASTCLASS_SCOPEBLOCK))
+	dowhile->append(parseConstruct(ASTKIND_SCOPEBLOCK))
 
 	'' WHILE
-	cExpectMatch(KW_WHILE, "behind do loop body")
+	expectMatch(KW_WHILE, "behind do loop body")
 
 	'' loop condition expression
-	dowhile->expr = cConditionExpr()
+	dowhile->expr = parseConditionExpr()
 
 	if semi_is_optional then
-		cMatch(TK_SEMI)
+		match(TK_SEMI)
 	else
-		cExpectMatch(TK_SEMI, "behind do/while loop")
+		expectMatch(TK_SEMI, "behind do/while loop")
 	end if
 
 	function = dowhile
 end function
 
-'' WHILE '(' Expression ')' Construct
-private function cWhile() as ASTNODE ptr
-	var whileloop = astNew(ASTCLASS_WHILE)
+'' WHILE '(' Expr ')' Construct
+function CParser.parseWhile() as AstNode ptr
+	var whileloop = astNew(ASTKIND_WHILE)
 
 	'' WHILE
-	assert(tkGet(c.x) = KW_WHILE)
-	c.x += 1
+	assert(tk->get(x) = KW_WHILE)
+	x += 1
 
 	'' loop condition expression
-	whileloop->expr = cConditionExpr()
+	whileloop->expr = parseConditionExpr()
 
 	'' loop body
-	astAppend(whileloop, cConstruct(ASTCLASS_SCOPEBLOCK))
+	whileloop->append(parseConstruct(ASTKIND_SCOPEBLOCK))
 
 	function = whileloop
 end function
 
 '' EXTERN "C" { ... }
-private function cExternBlock() as ASTNODE ptr
-	assert(tkGet(c.x) = KW_EXTERN)
-	c.x += 1
+function CParser.parseExternBlock() as AstNode ptr
+	assert(tk->get(x) = KW_EXTERN)
+	x += 1
 
-	if tkGet(c.x) <> TK_STRING then
-		cError("expected <""C""> behind <extern>")
+	if tk->get(x) <> TK_STRING then
+		showError("expected <""C""> behind <extern>")
 		return astNewGROUP()
 	end if
 	scope
-		var s = cLiteral(ASTCLASS_STRING, TRUE)
+		var s = parseLiteral(ASTKIND_STRING, TRUE)
 		if *s->text <> "C" then
-			cError("expected <""C""> behind <extern>")
+			showError("expected <""C""> behind <extern>")
 			return astNewGROUP()
 		end if
-		astDelete(s)
+		delete s
 	end scope
 
-	cExpectMatch(TK_LBRACE, "for <extern ""C""> block")
+	expectMatch(TK_LBRACE, "for <extern ""C""> block")
 
-	function = cBody(ASTCLASS_EXTERNBLOCKBEGIN)
+	function = parseBody(ASTKIND_EXTERNBLOCKBEGIN)
 
-	cExpectMatch(TK_RBRACE, "for <extern ""C""> block")
+	expectMatch(TK_RBRACE, "for <extern ""C""> block")
 end function
 
-private function cConstruct(byval bodyastclass as integer) as ASTNODE ptr
-	if tkGet(c.x) = TK_FBCODE then
-		var n = astNew(ASTCLASS_FBCODE, tkGetText(c.x))
-		c.x += 1
+function CParser.parseConstruct(byval bodyastkind as integer) as AstNode ptr
+	if tk->get(x) = TK_FBCODE then
+		var n = astNew(ASTKIND_FBCODE, tk->getText(x))
+		x += 1
 		return n
 	end if
 
 	'' TODO: only parse #defines at toplevel, not inside structs etc.
 	'' '#'?
-	if (tkGet(c.x) = TK_HASH) and tkIsStartOfDirective(c.x) then
-		c.x += 1
+	if (tk->get(x) = TK_HASH) and tk->isStartOfDirective(x) then
+		x += 1
 
-		dim directive as ASTNODE ptr
-		if tkGet(c.x) = TK_ID then
-			select case *tkSpellId(c.x)
+		dim directive as AstNode ptr
+		if tk->get(x) = TK_ID then
+			select case *tk->spellId(x)
 			case "define"
-				directive = cDefine()
+				directive = parseDefine()
 			case "undef"
-				directive = cUndef()
+				directive = parseUndef()
 			case "include"
-				directive = cInclude()
+				directive = parseInclude()
 			case "pragma"
-				c.x += 1
+				x += 1
 
-				select case tkSpell(c.x)
+				select case tk->spell(x)
 				case "pack"
-					directive = cPragmaPack()
+					directive = parsePragmaPack()
 				case "comment"
-					directive = cPragmaComment()
+					directive = parsePragmaComment()
 				end select
 			end select
 		end if
 
 		if directive = NULL then
-			cError("unknown CPP directive")
+			showError("unknown CPP directive")
 			directive = astNewGROUP()
 		end if
 
 		return directive
 	end if
 
-	if bodyastclass = ASTCLASS_ENUM then
-		return cEnumConst()
+	if bodyastkind = ASTKIND_ENUM then
+		return parseEnumConst()
 	end if
 
-	select case tkGet(c.x)
+	select case tk->get(x)
 	case KW_TYPEDEF
-		return cTypedef()
+		return parseTypedef()
 	case TK_SEMI
 		'' Ignore standalone ';'
-		c.x += 1
+		x += 1
 		return astNewGROUP()
-	case TK_LBRACE : return cScope()
-	case KW_IF     : return cIfBlock()
-	case KW_DO     : return cDoWhile(FALSE)
-	case KW_WHILE  : return cWhile()
-	case KW_RETURN : return cReturn()
+	case TK_LBRACE : return parseScope()
+	case KW_IF     : return parseIfBlock()
+	case KW_DO     : return parseDoWhile(FALSE)
+	case KW_WHILE  : return parseWhile()
+	case KW_RETURN : return parseReturn()
 	case KW_EXTERN
-		if tkGet(c.x + 1) = TK_STRING then
-			return cExternBlock()
+		if tk->get(x + 1) = TK_STRING then
+			return parseExternBlock()
 		end if
 	end select
 
-	select case bodyastclass
-	case ASTCLASS_STRUCT, ASTCLASS_UNION
+	select case bodyastkind
+	case ASTKIND_STRUCT, ASTKIND_UNION
 		'' Field declaration
-		function = cDeclaration(ASTCLASS_FIELD, 0)
-	case ASTCLASS_SCOPEBLOCK
+		function = parseDecl(ASTKIND_FIELD, 0)
+	case ASTKIND_SCOPEBLOCK
 		'' Disambiguate: local declaration vs. expression
 		'' If it starts with a data type, __attribute__, or 'static',
 		'' then it must be a declaration.
-		if (tkGet(c.x) = KW_STATIC) orelse hIsDataTypeOrAttribute(c.x) then
-			function = cVarOrProcDecl(TRUE)
+		if (tk->get(x) = KW_STATIC) orelse isDataTypeOrAttribute(x) then
+			function = parseVarOrProcDecl(TRUE)
 		else
-			function = cExpressionStatement()
+			function = parseExprStatement()
 		end if
 	case else
-		function = cVarOrProcDecl(FALSE)
+		function = parseVarOrProcDecl(FALSE)
 	end select
 end function
 
-private sub hSetLocationIfNeeded(byval n as ASTNODE ptr, byval location as TkLocation)
+private sub hSetLocationIfNeeded(byval n as AstNode ptr, byval location as TkLocation)
 	if n->location.source = NULL then
 		n->location = location
 	end if
 end sub
 
-private function cBody(byval bodyastclass as integer) as ASTNODE ptr
+function CParser.parseBody(byval bodyastkind as integer) as AstNode ptr
 	var result = astNewGROUP()
 
 	do
-		select case tkGet(c.x)
+		select case tk->get(x)
 		case TK_EOF
 			exit do
 
 		'' End of #define body
 		case TK_EOL
-			assert(c.parentdefine)
+			assert(parentdefine)
 			exit do
 
 		'' '}' (end of block)
 		case TK_RBRACE
-			if bodyastclass >= 0 then
+			if bodyastkind >= 0 then
 				exit do
 			end if
 		end select
 
-		var begin = c.x
-		var t = cConstruct(bodyastclass)
+		var begin = x
+		var t = parseConstruct(bodyastkind)
 
-		hErrorForRemainingCommasOrAssigns(t)
+		showErrorForRemainingCommasOrAssigns(t)
 
-		if c.parseok = FALSE then
-			c.parseok = TRUE
+		if parseok = FALSE then
+			parseok = TRUE
 
 			'' Skip current construct and preserve its tokens in
 			'' an UNKNOWN node
-			c.x = hSkipConstruct(begin, FALSE)
-			hTurnIntoUNKNOWN(t, begin, c.x - 1)
+			x = tk->skipConstruct(begin, FALSE)
+			turnIntoUNKNOWN(t, begin, x - 1)
 		end if
 
 		'' Assign source location to declarations
 		'' For toplevel declarations (not fields/parameters) this will
 		'' be used to distribute them based on -emit patterns.
-		var location = tkGetLocation(begin)
-		if t->class = ASTCLASS_GROUP then
+		var location = tk->getLocation(begin)
+		if t->kind = ASTKIND_GROUP then
 			var i = t->head
 			while i
 				hSetLocationIfNeeded(i, location)
 				i->location = location
-				i = i->next
+				i = i->nxt
 			wend
 		else
 			hSetLocationIfNeeded(t, location)
 		end if
 
-		astAppend(result, t)
+		result->append(t)
 	loop
 
 	function = result
 end function
 
-function cMain() as ASTNODE ptr
-	var t = cBody(-1)
+function CParser.parseToplevel() as AstNode ptr
+	var t = parseBody(-1)
 
 	'' Process the #define bodies which weren't parsed yet
-	for i as integer = 0 to c.defbodycount - 1
-		with c.defbodies[i]
-			c.parseok = TRUE
-			c.x = .xbodybegin
+	for i as integer = 0 to defbodycount - 1
+		with defbodies[i]
+			parseok = TRUE
+			x = .xbodybegin
 
 			'' Parse #define body
 			var add_to_ast = TRUE
-			cParseDefBody(.n, .xdefbegin, add_to_ast)
+			parseDefBody(.n, .xdefbegin, add_to_ast)
 
 			if add_to_ast = FALSE then
-				astRemove(t, .n)
+				t->remove(.n)
 			end if
 		end with
 	next

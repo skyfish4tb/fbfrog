@@ -1,4 +1,5 @@
-#include once "fbfrog.bi"
+#include once "util-str.bi"
+#include once "chars.bi"
 #include once "crt.bi"
 
 function hTrim(byref s as string) as string
@@ -105,8 +106,12 @@ end function
 function strIsValidSymbolId(byval s as const zstring ptr) as integer
 	var i = 0
 	do
-		select case as const (*s)[0]
+		select case as const (*s)[i]
 		case 0
+			'' Must not be empty
+			if i = 0 then
+				return FALSE
+			end if
 			exit do
 
 		case CH_A to CH_Z, CH_L_A to CH_L_Z, CH_UNDERSCORE
@@ -115,14 +120,13 @@ function strIsValidSymbolId(byval s as const zstring ptr) as integer
 		case CH_0 to CH_9
 			'' Numbers are allowed but not at the front
 			if i = 0 then
-				exit function
+				return FALSE
 			end if
 
 		case else
-			exit function
+			return FALSE
 		end select
 
-		s += 1
 		i += 1
 	loop
 
@@ -214,13 +218,13 @@ destructor StringMatcher()
 	deallocate(children)
 end destructor
 
-sub StringMatcher.addChild(byval nodeclass as integer, byval text as const ubyte ptr, byval textlength as integer)
+sub StringMatcher.addChild(byval nodekind as integer, byval text as const ubyte ptr, byval textlength as integer)
 	var i = childcount
 	childcount += 1
 	children = reallocate(children, sizeof(*children) * childcount)
 	clear(children[i], 0, sizeof(children[i]))
 	with children[i]
-		.nodeclass = nodeclass
+		.nodekind = nodekind
 		if text then
 			.text = allocate(textlength + 1)
 			memcpy(.text, text, textlength)
@@ -230,12 +234,12 @@ sub StringMatcher.addChild(byval nodeclass as integer, byval text as const ubyte
 	end with
 end sub
 
-sub StringMatcher.addChildHoldingPreviousChildren(byval nodeclass as integer, byval text as const ubyte ptr, byval textlength as integer)
+sub StringMatcher.addChildHoldingPreviousChildren(byval nodekind as integer, byval text as const ubyte ptr, byval textlength as integer)
 	var prevchildren = children
 	var prevchildcount = childcount
 	children = NULL
 	childcount = 0
-	addChild(nodeclass, text, textlength)
+	addChild(nodekind, text, textlength)
 	with children[0]
 		.children = prevchildren
 		.childcount = prevchildcount
@@ -299,7 +303,7 @@ sub StringMatcher.addPattern(byval pattern as const zstring ptr, byval payload a
 	for i as integer = 0 to childcount - 1
 		var child = @children[i]
 
-		select case child->nodeclass
+		select case child->nodekind
 		case MatchWildcard
 			if (*pattern)[0] = CH_STAR then
 				'' WILDCARD node is already here, recursively add the rest
@@ -358,7 +362,7 @@ sub StringMatcher.addPattern(byval pattern as const zstring ptr, byval payload a
 end sub
 
 function StringMatcher.matches(byval s as const zstring ptr, byref payload as any ptr) as integer
-	select case nodeclass
+	select case nodekind
 	case MatchRoot
 		for i as integer = 0 to childcount - 1
 			if children[i].matches(s, payload) then return TRUE
@@ -401,7 +405,7 @@ end function
 
 function StringMatcher.dump1() as string
 	dim s as string
-	select case nodeclass
+	select case nodekind
 	case MatchRoot     : s += "root nonEmpty=" & nonEmpty
 	case MatchString   : s += "string """ + *text + """" : if textlength <> len(*text) then s += " textlength=" & textlength & " (INVALID)"
 	case MatchWildcard : s += "wildcard"

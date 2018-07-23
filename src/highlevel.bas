@@ -1,10 +1,13 @@
 '' Higher level code transformations
 
-#include once "fbfrog.bi"
+#include once "highlevel.bi"
+
 #include once "emit.bi"
+#include once "util-path.bi"
+
 #include once "crt.bi"
 
-declare sub expandTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr)
+declare sub expandTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr)
 
 namespace hl
 	dim shared api as ApiInfo ptr
@@ -16,13 +19,13 @@ namespace hl
 	'' Used by forward declaration addition pass
 	type TYPENODE
 		id		as zstring ptr  '' Type name
-		definition	as ASTNODE ptr
+		definition	as AstNode ptr
 		forwarduse	as integer
-		firstuse	as ASTNODE ptr
+		firstuse	as AstNode ptr
 	end type
 	dim shared types as TYPENODE ptr
 	dim shared as integer typecount, typeroom
-	dim shared as ASTNODE ptr currentdecl
+	dim shared as AstNode ptr currentdecl
 
 	'' Used by Extern block addition pass
 	dim shared as integer need_extern, stdcalls, cdecls
@@ -33,10 +36,10 @@ namespace hl
 end namespace
 
 type ForwardInfo
-	defs as ASTNODE ptr ptr
+	defs as AstNode ptr ptr
 	defcount as integer
 	declare destructor()
-	declare sub append(byval def as ASTNODE ptr)
+	declare sub append(byval def as AstNode ptr)
 	declare sub remove(byval i as integer)
 end type
 
@@ -44,7 +47,7 @@ destructor ForwardInfo()
 	deallocate(defs)
 end destructor
 
-sub ForwardInfo.append(byval def as ASTNODE ptr)
+sub ForwardInfo.append(byval def as AstNode ptr)
 	var i = defcount
 	defcount += 1
 	defs = reallocate(defs, sizeof(*defs) * defcount)
@@ -67,13 +70,13 @@ type ExpressionFixUp
 	symbols as THash = THash(10, TRUE)
 	forwards as ForwardInfo
 	declare sub collectSymbol(byval id as zstring ptr, byval dtype as integer)
-	declare function calculateCTypes(byval n as ASTNODE ptr) as integer
-	declare sub collectSymbolIfExprTypeIsKnown(byval id as zstring ptr, byval expr as ASTNODE ptr)
-	declare sub maybeCollectSymbol(byval n as ASTNODE ptr)
-	declare sub collectSymbolsAndCalculateTypes(byval n as ASTNODE ptr)
+	declare function calculateCTypes(byval n as AstNode ptr) as integer
+	declare sub collectSymbolIfExprTypeIsKnown(byval id as zstring ptr, byval expr as AstNode ptr)
+	declare sub maybeCollectSymbol(byval n as AstNode ptr)
+	declare sub collectSymbolsAndCalculateTypes(byval n as AstNode ptr)
 	declare sub handleForwards()
-	declare function fixExpression(byval n as ASTNODE ptr, byval is_bool_context as integer) as ASTNODE ptr
-	declare sub fixExpressions(byval n as ASTNODE ptr)
+	declare function fixExpression(byval n as AstNode ptr, byval is_bool_context as integer) as AstNode ptr
+	declare sub fixExpressions(byval n as AstNode ptr)
 	declare operator let(byref as const ExpressionFixUp) '' unimplemented
 end type
 
@@ -100,27 +103,27 @@ end function
 '' Note: assignment BOPs excluded, we can't easily handle those for the purposes
 '' of hlAddMathCasts() anyways, as the result type depends on the lhs, whose
 '' type we can typically not determine...
-private function typeCBop(byval astclass as integer, byval a as integer, byval b as integer) as integer
+private function typeCBop(byval astkind as integer, byval a as integer, byval b as integer) as integer
 	'' Logic/relational operations: result always is a 32bit int
-	select case as const astclass
-	case ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-	     ASTCLASS_CEQ, ASTCLASS_CNE, ASTCLASS_CLT, _
-	     ASTCLASS_CLE, ASTCLASS_CGT, ASTCLASS_CGE, _
-	     ASTCLASS_CLOGNOT, ASTCLASS_CDEFINED
+	select case as const astkind
+	case ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+	     ASTKIND_CEQ, ASTKIND_CNE, ASTKIND_CLT, _
+	     ASTKIND_CLE, ASTKIND_CGT, ASTKIND_CGE, _
+	     ASTKIND_CLOGNOT, ASTKIND_CDEFINED
 		return TYPE_LONG
 
 	'' sizeof() always returns size_t
-	case ASTCLASS_SIZEOF
+	case ASTKIND_SIZEOF
 		return TYPE_UINTEGER
 
 	'' Bitshifts: Ignore the rhs type
-	case ASTCLASS_SHL, ASTCLASS_SHR
+	case ASTKIND_SHL, ASTKIND_SHR
 		b = a
 
-	case ASTCLASS_IIF, _
-	     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, _
-	     ASTCLASS_ADD, ASTCLASS_SUB, ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD, _
-	     ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_UNARYPLUS _
+	case ASTKIND_IIF, _
+	     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, _
+	     ASTKIND_ADD, ASTKIND_SUB, ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD, _
+	     ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_UNARYPLUS _
 
 	case else
 		assert(FALSE)
@@ -235,59 +238,59 @@ end function
 
 '' Returns FALSE if some id reference couldn't be resolved (i.e. we couldn't
 '' determine the expression's type)
-function ExpressionFixUp.calculateCTypes(byval n as ASTNODE ptr) as integer
+function ExpressionFixUp.calculateCTypes(byval n as AstNode ptr) as integer
 	var allresolved = TRUE
 
 	scope
 		var i = n->head
 		while i
 			allresolved and= calculateCTypes(i)
-			i = i->next
+			i = i->nxt
 		wend
 	end scope
 
-	select case as const n->class
-	case ASTCLASS_TEXT
+	select case as const n->kind
+	case ASTKIND_TEXT
 		var item = symbols.lookup(n->text, hashHash(n->text))
 		if item->s then
-			astSetType(n, cint(item->data), NULL)
+			n->setType(cint(item->data), NULL)
 		else
-			astSetType(n, TYPE_NONE, NULL)
+			n->setType(TYPE_NONE, NULL)
 			allresolved = FALSE
 		end if
 
-	case ASTCLASS_CDEFINED
-		astSetType(n, TYPE_LONG, NULL)
+	case ASTKIND_CDEFINED
+		n->setType(TYPE_LONG, NULL)
 
-	case ASTCLASS_IIF, ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-	     ASTCLASS_CEQ, ASTCLASS_CNE, ASTCLASS_CLT, ASTCLASS_CLE, ASTCLASS_CGT, ASTCLASS_CGE, _
-	     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, ASTCLASS_SHL, ASTCLASS_SHR, _
-	     ASTCLASS_ADD, ASTCLASS_SUB, ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD, _
-	     ASTCLASS_CLOGNOT, ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_UNARYPLUS, _
-	     ASTCLASS_SIZEOF
+	case ASTKIND_IIF, ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+	     ASTKIND_CEQ, ASTKIND_CNE, ASTKIND_CLT, ASTKIND_CLE, ASTKIND_CGT, ASTKIND_CGE, _
+	     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, ASTKIND_SHL, ASTKIND_SHR, _
+	     ASTKIND_ADD, ASTKIND_SUB, ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD, _
+	     ASTKIND_CLOGNOT, ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_UNARYPLUS, _
+	     ASTKIND_SIZEOF
 		'' IIF and BOPs will have two operands (ldtype/rdtype will be different),
 		'' UOPs will have one operand (i.e. ldtype/rdtype will be the same)
 		var ldtype = n->head->dtype
 		var rdtype = n->tail->dtype
-		astSetType(n, typeCBop(n->class, ldtype, rdtype), NULL)
+		n->setType(typeCBop(n->kind, ldtype, rdtype), NULL)
 	end select
 
 	function = allresolved
 end function
 
-sub ExpressionFixUp.collectSymbolIfExprTypeIsKnown(byval id as zstring ptr, byval expr as ASTNODE ptr)
+sub ExpressionFixUp.collectSymbolIfExprTypeIsKnown(byval id as zstring ptr, byval expr as AstNode ptr)
 	if expr->dtype <> TYPE_NONE then
 		collectSymbol(id, expr->dtype)
 	end if
 end sub
 
-sub ExpressionFixUp.maybeCollectSymbol(byval n as ASTNODE ptr)
-	select case n->class
-	case ASTCLASS_PPDEFINE
-		if n->expr andalso n->expr->class <> ASTCLASS_SCOPEBLOCK then
+sub ExpressionFixUp.maybeCollectSymbol(byval n as AstNode ptr)
+	select case n->kind
+	case ASTKIND_PPDEFINE
+		if n->expr andalso n->expr->kind <> ASTKIND_SCOPEBLOCK then
 			collectSymbolIfExprTypeIsKnown(n->text, n->expr)
 		end if
-	case ASTCLASS_CONST
+	case ASTKIND_CONST
 		if n->attrib and ASTATTRIB_ENUMCONST then
 			'' enumconsts are always ints
 			collectSymbol(n->text, TYPE_LONG)
@@ -305,7 +308,7 @@ end sub
 '' one defined later, we have to add it to a list for processing later in
 '' handleForwards().
 ''
-sub ExpressionFixUp.collectSymbolsAndCalculateTypes(byval n as ASTNODE ptr)
+sub ExpressionFixUp.collectSymbolsAndCalculateTypes(byval n as AstNode ptr)
 	if n->expr then
 		var result = calculateCTypes(n->expr)
 		if result = FALSE then
@@ -323,7 +326,7 @@ sub ExpressionFixUp.collectSymbolsAndCalculateTypes(byval n as ASTNODE ptr)
 	var i = n->head
 	while i
 		collectSymbolsAndCalculateTypes(i)
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
@@ -361,25 +364,25 @@ end sub
 
 '' Fix up casts on string literals by adding an address-of operation:
 ''    cptr(foo ptr, "bar") => cptr(foo ptr, @"bar")
-private sub hlFixAddrOfStrLit(byval n as ASTNODE ptr)
+private sub hlFixAddrOfStrLit(byval n as AstNode ptr)
 	var i = n->head
 	while i
 		hlFixAddrOfStrLit(i)
-		i = i->next
+		i = i->nxt
 	wend
 
-	if (n->class = ASTCLASS_CAST) andalso _
-	   ((n->head->class = ASTCLASS_STRING) or _
-	    (n->head->class = ASTCLASS_STRCAT)) then
+	if (n->kind = ASTKIND_CAST) andalso _
+	   ((n->head->kind = ASTKIND_STRING) or _
+	    (n->head->kind = ASTKIND_STRCAT)) then
 		var strlit = n->head
-		astUnlink(n, n->head)
-		strlit = astNew(ASTCLASS_ADDROF, strlit)
-		astPrepend(n, strlit)
+		n->unlink(n->head)
+		strlit = astNew(ASTKIND_ADDROF, strlit)
+		n->prepend(strlit)
 	end if
 end sub
 
-private function hIsUlongCast(byval n as ASTNODE ptr) as integer
-	function = n andalso (n->class = ASTCLASS_CAST) andalso (n->dtype = TYPE_ULONG)
+private function hIsUlongCast(byval n as AstNode ptr) as integer
+	function = n andalso (n->kind = ASTKIND_CAST) andalso (n->dtype = TYPE_ULONG)
 end function
 
 ''
@@ -396,23 +399,23 @@ end function
 '' In order to make sure we always get &hFFFFFF9Cu in FB, we have to truncate
 '' the operation's result to 32bit explicitly.
 ''
-private function hlAddMathCasts(byval parent as ASTNODE ptr, byval n as ASTNODE ptr) as ASTNODE ptr
+private function hlAddMathCasts(byval parent as AstNode ptr, byval n as AstNode ptr) as AstNode ptr
 	var i = n->head
 	while i
-		i = astReplace(n, i, hlAddMathCasts(n, astClone(i)))
+		i = n->replace(i, hlAddMathCasts(n, i->clone()))
 	wend
 
-	select case as const n->class
-	case ASTCLASS_IIF, ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-	     ASTCLASS_CEQ, ASTCLASS_CNE, ASTCLASS_CLT, ASTCLASS_CLE, ASTCLASS_CGT, ASTCLASS_CGE, _
-	     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, ASTCLASS_SHL, ASTCLASS_SHR, _
-	     ASTCLASS_ADD, ASTCLASS_SUB, ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD, _
-	     ASTCLASS_CLOGNOT, ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_UNARYPLUS, _
-	     ASTCLASS_SIZEOF
+	select case as const n->kind
+	case ASTKIND_IIF, ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+	     ASTKIND_CEQ, ASTKIND_CNE, ASTKIND_CLT, ASTKIND_CLE, ASTKIND_CGT, ASTKIND_CGE, _
+	     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, ASTKIND_SHL, ASTKIND_SHR, _
+	     ASTKIND_ADD, ASTKIND_SUB, ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD, _
+	     ASTKIND_CLOGNOT, ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_UNARYPLUS, _
+	     ASTKIND_SIZEOF
 		'' Wrap uint32 operation in a cast, unless there already is a cast
 		'' TODO: don't add cast if n is a cast
 		if (n->dtype = TYPE_ULONG) and (not hIsUlongCast(parent)) then
-			n = astNew(ASTCLASS_CAST, n)
+			n = astNew(ASTKIND_CAST, n)
 			n->dtype = TYPE_ULONG
 		end if
 	end select
@@ -420,20 +423,20 @@ private function hlAddMathCasts(byval parent as ASTNODE ptr, byval n as ASTNODE 
 	function = n
 end function
 
-private function astOpsC2FB(byval n as ASTNODE ptr, byval is_bool_context as integer) as ASTNODE ptr
-	select case n->class
-	case ASTCLASS_CLOGNOT, ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-	     ASTCLASS_CEQ, ASTCLASS_CNE, ASTCLASS_IIF
+private function astOpsC2FB(byval n as AstNode ptr, byval is_bool_context as integer) as AstNode ptr
+	select case n->kind
+	case ASTKIND_CLOGNOT, ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+	     ASTKIND_CEQ, ASTKIND_CNE, ASTKIND_IIF
 		var l_is_bool_context = FALSE
 		var r_is_bool_context = FALSE
 
-		select case n->class
+		select case n->kind
 		'' ! operand is treated as bool
-		case ASTCLASS_CLOGNOT
+		case ASTKIND_CLOGNOT
 			l_is_bool_context = TRUE
 
 		'' andalso/orelse operands are always treated as bools
-		case ASTCLASS_CLOGOR, ASTCLASS_CLOGAND
+		case ASTKIND_CLOGOR, ASTKIND_CLOGAND
 			l_is_bool_context = TRUE
 			r_is_bool_context = TRUE
 
@@ -442,90 +445,90 @@ private function astOpsC2FB(byval n as ASTNODE ptr, byval is_bool_context as int
 		''    x <> 0
 		'' (not x = -1 and x <> -1 because if checks check against 0 and <> 0,
 		'' not 0 and -1)
-		case ASTCLASS_CEQ, ASTCLASS_CNE
+		case ASTKIND_CEQ, ASTKIND_CNE
 			if astIsCONSTI(n->tail) then
-				l_is_bool_context = (astEvalConstiAsInt64(n->tail) = 0)
+				l_is_bool_context = (n->tail->evalConstiAsInt64() = 0)
 			end if
 
 		'' iif() condition always is treated as bool
-		case ASTCLASS_IIF
+		case ASTKIND_IIF
 			n->expr = astOpsC2FB(n->expr, TRUE)
 		end select
 
-		astReplace(n, n->head, astOpsC2FB(astClone(n->head), l_is_bool_context))
+		n->replace(n->head, astOpsC2FB(n->head->clone(), l_is_bool_context))
 		if n->head <> n->tail then
-			assert(n->head->next = n->tail)
-			astReplace(n, n->tail, astOpsC2FB(astClone(n->tail), r_is_bool_context))
+			assert(n->head->nxt = n->tail)
+			n->replace(n->tail, astOpsC2FB(n->tail->clone(), r_is_bool_context))
 		end if
 
 	case else
 		var i = n->head
 		while i
-			i = astReplace(n, i, astOpsC2FB(astClone(i), FALSE))
+			i = n->replace(i, astOpsC2FB(i->clone(), FALSE))
 		wend
 	end select
 
-	select case n->class
-	case ASTCLASS_CLOGNOT, ASTCLASS_CDEFINED, _
-	     ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-	     ASTCLASS_CEQ, ASTCLASS_CNE, _
-	     ASTCLASS_CLT, ASTCLASS_CLE, _
-	     ASTCLASS_CGT, ASTCLASS_CGE
+	select case n->kind
+	case ASTKIND_CLOGNOT, ASTKIND_CDEFINED, _
+	     ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+	     ASTKIND_CEQ, ASTKIND_CNE, _
+	     ASTKIND_CLT, ASTKIND_CLE, _
+	     ASTKIND_CGT, ASTKIND_CGE
 
-		select case n->class
-		case ASTCLASS_CLOGNOT
+		select case n->kind
+		case ASTKIND_CLOGNOT
 			'' Turn C's "!x" into FB's "x = 0"
-			n->class = ASTCLASS_EQ
-			var zero = astNew(ASTCLASS_CONSTI, "0")
-			astSetType(zero, TYPE_LONG, NULL)
-			astAppend(n, zero)
-		case ASTCLASS_CDEFINED : n->class = ASTCLASS_DEFINED
-		case ASTCLASS_CLOGOR   : n->class = ASTCLASS_LOGOR
-		case ASTCLASS_CLOGAND  : n->class = ASTCLASS_LOGAND
-		case ASTCLASS_CEQ      : n->class = ASTCLASS_EQ
-		case ASTCLASS_CNE      : n->class = ASTCLASS_NE
-		case ASTCLASS_CLT      : n->class = ASTCLASS_LT
-		case ASTCLASS_CLE      : n->class = ASTCLASS_LE
-		case ASTCLASS_CGT      : n->class = ASTCLASS_GT
-		case ASTCLASS_CGE      : n->class = ASTCLASS_GE
+			n->kind = ASTKIND_EQ
+			var zero = astNew(ASTKIND_CONSTI, "0")
+			zero->setType(TYPE_LONG, NULL)
+			n->append(zero)
+		case ASTKIND_CDEFINED : n->kind = ASTKIND_DEFINED
+		case ASTKIND_CLOGOR   : n->kind = ASTKIND_LOGOR
+		case ASTKIND_CLOGAND  : n->kind = ASTKIND_LOGAND
+		case ASTKIND_CEQ      : n->kind = ASTKIND_EQ
+		case ASTKIND_CNE      : n->kind = ASTKIND_NE
+		case ASTKIND_CLT      : n->kind = ASTKIND_LT
+		case ASTKIND_CLE      : n->kind = ASTKIND_LE
+		case ASTKIND_CGT      : n->kind = ASTKIND_GT
+		case ASTKIND_CGE      : n->kind = ASTKIND_GE
 		case else              : assert(FALSE)
 		end select
 
 		'' Turn -1|0 into 1|0 if the value may be used in math calculations etc.
 		if is_bool_context = FALSE then
-			n = astNew(ASTCLASS_NEGATE, n)
+			n = astNew(ASTKIND_NEGATE, n)
 		end if
 	end select
 
 	function = n
 end function
 
-private sub hlRemoveExpressionTypes(byval n as ASTNODE ptr)
+private sub hlRemoveExpressionTypes(byval n as AstNode ptr)
 	var i = n->head
 	while i
 		hlRemoveExpressionTypes(i)
-		i = i->next
+		i = i->nxt
 	wend
 
-	if n->class <> ASTCLASS_CAST then
-		select case as const n->class
-		case ASTCLASS_IIF, ASTCLASS_LOGOR, ASTCLASS_LOGAND, _
-		     ASTCLASS_EQ, ASTCLASS_NE, ASTCLASS_LT, ASTCLASS_LE, ASTCLASS_GT, ASTCLASS_GE, _
-		     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, ASTCLASS_SHL, ASTCLASS_SHR, _
-		     ASTCLASS_ADD, ASTCLASS_SUB, ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD, _
-		     ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_UNARYPLUS, _
-		     ASTCLASS_SIZEOF, ASTCLASS_DEFINED, ASTCLASS_TEXT
-			astSetType(n, TYPE_NONE, NULL)
+	if n->kind <> ASTKIND_CAST then
+		select case as const n->kind
+		case ASTKIND_IIF, ASTKIND_LOGOR, ASTKIND_LOGAND, _
+		     ASTKIND_EQ, ASTKIND_NE, ASTKIND_LT, ASTKIND_LE, ASTKIND_GT, ASTKIND_GE, _
+		     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, ASTKIND_SHL, ASTKIND_SHR, _
+		     ASTKIND_ADD, ASTKIND_SUB, ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD, _
+		     ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_UNARYPLUS, _
+		     ASTKIND_SIZEOF, ASTKIND_DEFINED, ASTKIND_TEXT
+			n->setType(TYPE_NONE, NULL)
 
-		case ASTCLASS_CLOGOR, ASTCLASS_CLOGAND, _
-		     ASTCLASS_CEQ, ASTCLASS_CNE, ASTCLASS_CLT, ASTCLASS_CLE, ASTCLASS_CGT, ASTCLASS_CGE, _
-		     ASTCLASS_CLOGNOT, ASTCLASS_CDEFINED
+		case ASTKIND_CLOGOR, ASTKIND_CLOGAND, _
+		     ASTKIND_CEQ, ASTKIND_CNE, ASTKIND_CLT, ASTKIND_CLE, ASTKIND_CGT, ASTKIND_CGE, _
+		     ASTKIND_CLOGNOT, ASTKIND_CDEFINED
 			assert(FALSE)
 		end select
 	end if
 end sub
 
-function ExpressionFixUp.fixExpression(byval n as ASTNODE ptr, byval is_bool_context as integer) as ASTNODE ptr
+function ExpressionFixUp.fixExpression(byval n as AstNode ptr, byval is_bool_context as integer) as AstNode ptr
 	hlFixAddrOfStrLit(n)
 	n = hlAddMathCasts(NULL, n)
 
@@ -539,13 +542,13 @@ function ExpressionFixUp.fixExpression(byval n as ASTNODE ptr, byval is_bool_con
 	function = n
 end function
 
-sub ExpressionFixUp.fixExpressions(byval n as ASTNODE ptr)
+sub ExpressionFixUp.fixExpressions(byval n as AstNode ptr)
 	if n->expr then
 		'' TODO: shouldn't assume is_bool_context=TRUE for #define bodies
 		var is_bool_context = FALSE
-		select case n->class
-		case ASTCLASS_PPDEFINE, ASTCLASS_IFPART, ASTCLASS_ELSEIFPART, _
-		     ASTCLASS_DOWHILE, ASTCLASS_WHILE
+		select case n->kind
+		case ASTKIND_PPDEFINE, ASTKIND_IFPART, ASTKIND_ELSEIFPART, _
+		     ASTKIND_DOWHILE, ASTKIND_WHILE
 			is_bool_context = TRUE
 		end select
 
@@ -559,35 +562,35 @@ sub ExpressionFixUp.fixExpressions(byval n as ASTNODE ptr)
 	var i = n->head
 	while i
 		fixExpressions(i)
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private function isEmptyReservedDefine(byval n as ASTNODE ptr) as integer
-	function = (n->class = ASTCLASS_PPDEFINE) andalso _
+private function isEmptyReservedDefine(byval n as AstNode ptr) as integer
+	function = (n->kind = ASTKIND_PPDEFINE) andalso _
 	           (n->paramcount < 0) andalso (n->expr = NULL) andalso _
 	           strIsReservedIdInC(n->text)
 end function
 
-private sub hlRemoveEmptyReservedDefines(byval ast as ASTNODE ptr)
+private sub hlRemoveEmptyReservedDefines(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 		if isEmptyReservedDefine(i) then
-			astRemove(ast, i)
+			ast->remove(i)
 		end if
 		i = nxt
 	wend
 end sub
 
-private sub hlApplyRemoveOption(byval ast as ASTNODE ptr, byval astclass as integer, byval opt as integer)
+private sub hlApplyRemoveOption(byval ast as AstNode ptr, byval astkind as integer, byval opt as integer)
 	var i = ast->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
-		if (i->text <> NULL) and (astclass = -1) or (i->class = astclass) then
+		if (i->text <> NULL) and (astkind = -1) or (i->kind = astkind) then
 			if hl.api->idopt(opt).matches(i->text) then
-				astRemove(ast, i)
+				ast->remove(i)
 			end if
 		end if
 
@@ -595,17 +598,17 @@ private sub hlApplyRemoveOption(byval ast as ASTNODE ptr, byval astclass as inte
 	wend
 end sub
 
-private sub hlApplyRemove1st(byval ast as ASTNODE ptr)
+private sub hlApplyRemove1st(byval ast as AstNode ptr)
 	dim removed as THash = THash(7, TRUE)
 	var i = ast->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
 		if i->text then
 			if hl.api->idopt(tktokens.OPT_REMOVE1ST).matches(i->text) and _
 			   (not removed.contains(i->text, hashHash(i->text))) then
 				removed.addOverwrite(i->text, NULL)
-				astRemove(ast, i)
+				ast->remove(i)
 			end if
 		end if
 
@@ -613,16 +616,16 @@ private sub hlApplyRemove1st(byval ast as ASTNODE ptr)
 	wend
 end sub
 
-private sub hlApplyRemove2nd(byval ast as ASTNODE ptr)
+private sub hlApplyRemove2nd(byval ast as AstNode ptr)
 	dim found1st as THash = THash(7, FALSE)
 	var i = ast->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
 		if i->text then
 			if hl.api->idopt(tktokens.OPT_REMOVE2ND).matches(i->text) then
 				if found1st.contains(i->text, hashHash(i->text)) then
-					astRemove(ast, i)
+					ast->remove(i)
 				else
 					found1st.addOverwrite(i->text, NULL)
 				end if
@@ -633,23 +636,23 @@ private sub hlApplyRemove2nd(byval ast as ASTNODE ptr)
 	wend
 end sub
 
-private sub hlApplyDropProcBodyOptions(byval ast as ASTNODE ptr)
+private sub hlApplyDropProcBodyOptions(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if (i->class = ASTCLASS_PROC) and (i->expr <> NULL) then
+		if (i->kind = ASTKIND_PROC) and (i->expr <> NULL) then
 			if hl.api->idopt(tktokens.OPT_DROPPROCBODY).matches(i->text) then
-				astDelete(i->expr)
+				delete i->expr
 				i->expr = NULL
 			end if
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub hlApplyMoveOption(byval ast as ASTNODE ptr, byref search as string, byref ref as string)
-	dim as ASTNODE ptr decltomove, refdecl
+private sub hlApplyMoveOption(byval ast as AstNode ptr, byref search as string, byref ref as string)
+	dim as AstNode ptr decltomove, refdecl
 
 	var i = ast->head
 	while i
@@ -661,24 +664,24 @@ private sub hlApplyMoveOption(byval ast as ASTNODE ptr, byref search as string, 
 				refdecl = i
 			end select
 		end if
-		i = i->next
+		i = i->nxt
 	wend
 
 	if (decltomove <> NULL) and (refdecl <> NULL) then
-		astUnlink(ast, decltomove)
-		astInsert(ast, decltomove, refdecl)
+		ast->unlink(decltomove)
+		ast->insert(decltomove, refdecl)
 	end if
 end sub
 
 '' Apply -setarraysize options, to arrays' "first" dimension
-private function hlSetArraySizes(byval n as ASTNODE ptr) as integer
+private function hlSetArraySizes(byval n as AstNode ptr) as integer
 	if (n->text <> NULL) and (n->array <> NULL) then
 		var dimension = n->array->head
-		assert(dimension->class = ASTCLASS_DIMENSION)
-		if dimension->expr->class = ASTCLASS_ELLIPSIS then
+		assert(dimension->kind = ASTKIND_DIMENSION)
+		if dimension->expr->kind = ASTKIND_ELLIPSIS then
 			dim size as zstring ptr = hl.api->setarraysizeoptions.lookupDataOrNull(n->text)
 			if size then
-				astDelete(dimension->expr)
+				delete dimension->expr
 				dimension->expr = astNewTEXT(size)
 			end if
 		end if
@@ -686,17 +689,17 @@ private function hlSetArraySizes(byval n as ASTNODE ptr) as integer
 	function = TRUE
 end function
 
-private sub doRename(byval n as ASTNODE ptr, byval newid as zstring ptr)
-	if n->class = ASTCLASS_PPINCLUDE then
+private sub doRename(byval n as AstNode ptr, byval newid as zstring ptr)
+	if n->kind = ASTKIND_PPINCLUDE then
 		'' Allow -rename to affect PPINCLUDE nodes, but without giving them
 		'' alias strings (which could prevent merging and would add them to renamelists)
-		astSetText(n, newid)
+		n->setText(newid)
 	else
-		astRenameSymbol(n, newid)
+		n->renameSymbol(newid)
 	end if
 end sub
 
-private function hApplyRenameOption(byval opt as integer, byval n as ASTNODE ptr) as integer
+private function hApplyRenameOption(byval opt as integer, byval n as AstNode ptr) as integer
 	dim as zstring ptr newid = hl.api->renameopt(opt).lookupDataOrNull(n->text)
 	if newid then
 		doRename(n, newid)
@@ -704,14 +707,14 @@ private function hApplyRenameOption(byval opt as integer, byval n as ASTNODE ptr
 	end if
 end function
 
-private function hlApplyRenameOption(byval n as ASTNODE ptr) as integer
+private function hlApplyRenameOption(byval n as AstNode ptr) as integer
 	static inside_macro as integer
 
 	if n->text then
 		'' Apply -rename[_] options to any declaration,
 		'' but not string literals and such
-		select case n->class
-		case ASTCLASS_STRING, ASTCLASS_CHAR
+		select case n->kind
+		case ASTKIND_STRING, ASTKIND_CHAR
 
 		case else
 			hApplyRenameOption(tktokens.OPT_RENAME, n)
@@ -731,30 +734,30 @@ private function hlApplyRenameOption(byval n as ASTNODE ptr) as integer
 		end if
 	end if
 
-	select case n->class
-	case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+	select case n->kind
+	case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 		if n->text then
 			hApplyRenameOption(tktokens.OPT_RENAMETAG, n)
 		end if
 
-	case ASTCLASS_PROC
+	case ASTKIND_PROC
 		if n->text then
 			hApplyRenameOption(tktokens.OPT_RENAMEPROC, n)
 		end if
 
-	case ASTCLASS_TYPEDEF
+	case ASTKIND_TYPEDEF
 		hApplyRenameOption(tktokens.OPT_RENAMETYPEDEF, n)
 
-	case ASTCLASS_PPDEFINE
+	case ASTKIND_PPDEFINE
 		hApplyRenameOption(tktokens.OPT_RENAMEDEFINE, n)
 
 		if hl.api->renameopt(tktokens.OPT_RENAMEMACROPARAM).count > 0 then
 			var param = n->head
 			var renamed_param_here = FALSE
 			while param
-				assert(param->class = ASTCLASS_MACROPARAM)
+				assert(param->kind = ASTKIND_MACROPARAM)
 				renamed_param_here or= hApplyRenameOption(tktokens.OPT_RENAMEMACROPARAM, param)
-				param = param->next
+				param = param->nxt
 			wend
 
 			'' Visit body to update references to renamed parameters,
@@ -764,15 +767,15 @@ private function hlApplyRenameOption(byval n as ASTNODE ptr) as integer
 			if renamed_param_here and (n->expr <> NULL) then
 				assert(inside_macro = FALSE)
 				inside_macro = TRUE
-				astVisit(n->expr, @hlApplyRenameOption)
+				n->expr->visit(@hlApplyRenameOption)
 				inside_macro = FALSE
 			end if
 		end if
 
-	case ASTCLASS_UNDEF
+	case ASTKIND_UNDEF
 		hApplyRenameOption(tktokens.OPT_RENAMEDEFINE, n)
 
-	case ASTCLASS_TEXT
+	case ASTKIND_TEXT
 		hApplyRenameOption(tktokens.OPT_RENAMEPROC, n)
 		hApplyRenameOption(tktokens.OPT_RENAMEDEFINE, n)
 		if inside_macro then
@@ -791,8 +794,8 @@ type TypedefTable
 	'' the id so it can be re-used by the hash table.
 	table as THash = THash(8, FALSE)
 	declare destructor()
-	declare function lookup(byval id as zstring ptr) as ASTNODE ptr
-	declare sub addOverwrite(byval n as ASTNODE ptr)
+	declare function lookup(byval id as zstring ptr) as AstNode ptr
+	declare sub addOverwrite(byval n as AstNode ptr)
 	declare operator let(byref as const TypedefTable) '' unimplemented
 end type
 
@@ -801,17 +804,17 @@ destructor TypedefTable()
 	for i as integer = 0 to table.room - 1
 		var item = table.items + i
 		if item->s then
-			astDelete(item->data)
+			delete cptr(AstNode ptr, item->data)
 		end if
 	next
 end destructor
 
-function TypedefTable.lookup(byval id as zstring ptr) as ASTNODE ptr
+function TypedefTable.lookup(byval id as zstring ptr) as AstNode ptr
 	function = table.lookupDataOrNull(id)
 end function
 
-sub TypedefTable.addOverwrite(byval n as ASTNODE ptr)
-	var datatype = astClone(n)
+sub TypedefTable.addOverwrite(byval n as AstNode ptr)
+	var datatype = n->clone()
 
 	'' Resolve typedefs to the type they reference
 	'' TODO: what about CONSTs/PTRs? it's not enough to walk to the
@@ -826,27 +829,27 @@ sub TypedefTable.addOverwrite(byval n as ASTNODE ptr)
 	var hash = hashHash(datatype->text)
 	var item = table.lookup(datatype->text, hash)
 	if item->s then
-		'' Free existing ASTNODE before overwriting, or else it would be leaked
-		astDelete(item->data)
+		'' Free existing AstNode before overwriting, or else it would be leaked
+		delete cptr(AstNode ptr, item->data)
 		item->s = NULL '' became dangling due to this
 	end if
 	table.add(item, hash, datatype->text, datatype)
 end sub
 
-private sub oopsCantExpandTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr, byref reason as string)
-	oops("can't expand " + astDumpPrettyDecl(typedef, TRUE) + " into " + astDumpPrettyDecl(n, TRUE) + ": " + reason)
+private sub oopsCantExpandTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr, byref reason as string)
+	oops("can't expand " + typedef->dumpPrettyDecl(TRUE) + " into " + n->dumpPrettyDecl(TRUE) + ": " + reason)
 end sub
 
 '' Expand typedef assuming it's only a simple type, no array or procedure
-private sub expandSimpleTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr)
+private sub expandSimpleTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr)
 	var newdtype = typeExpand(n->dtype, typedef->dtype)
 	if newdtype = TYPE_NONE then
 		oopsCantExpandTypedef(typedef, n, "too many pointers, or ref to ref")
 	end if
-	astSetType(n, newdtype, typedef->subtype)
+	n->setType(newdtype, typedef->subtype)
 end sub
 
-private sub expandArrayTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr)
+private sub expandArrayTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr)
 	'' Pointer to array?
 	if typeGetPtrCount(n->dtype) > 0 then
 		'' FB doesn't support pointers to arrays either, but we can drop the array type,
@@ -857,11 +860,11 @@ private sub expandArrayTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE 
 	end if
 
 	'' Expand the array typedef
-	astSetType(n, typeGetConst(n->dtype) or typedef->dtype, typedef->subtype)
+	n->setType(typeGetConst(n->dtype) or typedef->dtype, typedef->subtype)
 	if n->array = NULL then
-		n->array = astNew(ASTCLASS_ARRAY)
+		n->array = astNew(ASTKIND_ARRAY)
 	end if
-	astAppend(n->array, astCloneChildren(typedef->array))
+	n->array->append(typedef->array->cloneChildren())
 end sub
 
 ''
@@ -894,22 +897,22 @@ end sub
 '' be ignored, e.g. in case of:
 ''    a const * p1;
 ''
-private sub expandProcTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr)
-	select case n->class
-	case ASTCLASS_VAR, ASTCLASS_FIELD
+private sub expandProcTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr)
+	select case n->kind
+	case ASTKIND_VAR, ASTKIND_FIELD
 		'' Not a pointer?
 		if typeGetPtrCount(n->dtype) = 0 then
 			'' This is ok for vars/fields; they just become procedures themselves.
 			'' (although with fields that can only really happen in C++ code)
 			var proc = typedef->subtype
-			assert(proc->class = ASTCLASS_PROC)
+			assert(proc->kind = ASTKIND_PROC)
 
 			'' Copy over the function result type (overwriting any previous cv-qualifiers),
 			'' parameters, and callconv attributes
-			n->class = ASTCLASS_PROC
-			astSetType(n, proc->dtype, proc->subtype)
+			n->kind = ASTKIND_PROC
+			n->setType(proc->dtype, proc->subtype)
 			assert(n->head = NULL)
-			astAppend(n, astCloneChildren(proc))
+			n->append(proc->cloneChildren())
 			n->attrib or= proc->attrib
 
 			exit sub
@@ -917,7 +920,7 @@ private sub expandProcTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE p
 
 		'' var/field; it's a pointer to the function type; ok
 
-	case ASTCLASS_TYPEDEF, ASTCLASS_PARAM
+	case ASTKIND_TYPEDEF, ASTKIND_PARAM
 		'' Expanding typedef in another typedef; always ok
 		'' Expanding into param, also ok (it becomes a function pointer;
 		'' handled later in hlFixFunctionParameters())
@@ -934,16 +937,16 @@ private sub expandProcTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE p
 
 	'' Insert the typedef's type, overwriting the use of the typedef
 	assert(typeGetDtAndPtr(typedef->dtype) = TYPE_PROC)
-	astSetType(n, typeUnsetBaseConst(typeSetDt(n->dtype, TYPE_PROC)), typedef->subtype)
+	n->setType(typeUnsetBaseConst(typeSetDt(n->dtype, TYPE_PROC)), typedef->subtype)
 end sub
 
-'' Expand a typedef into a declaration (or any ASTNODE really), assuming that
+'' Expand a typedef into a declaration (or any AstNode really), assuming that
 '' the declaration's dtype uses that typedef.
 '' Expanding an array or procedure typedef requires special care, because then
 '' the declaration becomes an array or a procedure.
 '' It's not allowed/possible in C to have both at the same time (an array of
 '' procedures), so we don't need to handle that.
-private sub expandTypedef(byval typedef as ASTNODE ptr, byval n as ASTNODE ptr)
+private sub expandTypedef(byval typedef as AstNode ptr, byval n as AstNode ptr)
 	if typedef->array then
 		expandArrayTypedef(typedef, n)
 	elseif typeGetDtAndPtr(typedef->dtype) = TYPE_PROC then
@@ -955,14 +958,14 @@ end sub
 
 type TypedefExpander
 	typedefs as TypedefTable
-	declare sub walkDecls(byval n as ASTNODE ptr)
-	declare sub walkDefines(byval n as ASTNODE ptr)
+	declare sub walkDecls(byval n as AstNode ptr)
+	declare sub walkDefines(byval n as AstNode ptr)
 	declare operator let(byref as const TypedefExpander) '' unimplemented
 end type
 
-sub TypedefExpander.walkDecls(byval n as ASTNODE ptr)
+sub TypedefExpander.walkDecls(byval n as AstNode ptr)
 	'' Ignore #defines for now; they will be processed later by walkDefines()
-	if n->class = ASTCLASS_PPDEFINE then exit sub
+	if n->kind = ASTKIND_PPDEFINE then exit sub
 
 	'' Declaration using one of the typedefs?
 	if typeGetDt(n->dtype) = TYPE_UDT then
@@ -983,17 +986,17 @@ sub TypedefExpander.walkDecls(byval n as ASTNODE ptr)
 
 	var i = n->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
 		walkDecls(i)
 
 		'' Register & drop typedefs
-		if i->class = ASTCLASS_TYPEDEF then
+		if i->kind = ASTKIND_TYPEDEF then
 			if (i->array <> NULL) orelse _
 			   (typeGetDtAndPtr(i->dtype) = TYPE_PROC) orelse _
 			   hl.api->idopt(tktokens.OPT_EXPAND).matches(i->text) then
 				typedefs.addOverwrite(i)
-				astRemove(n, i)
+				n->remove(i)
 			end if
 		end if
 
@@ -1001,20 +1004,20 @@ sub TypedefExpander.walkDecls(byval n as ASTNODE ptr)
 	wend
 end sub
 
-sub TypedefExpander.walkDefines(byval n as ASTNODE ptr)
+sub TypedefExpander.walkDefines(byval n as AstNode ptr)
 	var i = n->head
 	while i
 
-		if (i->class = ASTCLASS_PPDEFINE) and (i->expr <> NULL) then
+		if (i->kind = ASTKIND_PPDEFINE) and (i->expr <> NULL) then
 			walkDecls(i->expr)
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private function hlFixSpecialParameters(byval n as ASTNODE ptr) as integer
-	if n->class = ASTCLASS_PARAM then
+private function hlFixSpecialParameters(byval n as AstNode ptr) as integer
+	if n->kind = ASTKIND_PARAM then
 		select case typeGetDtAndPtr(n->dtype)
 		'' Remap "byval as jmp_buf" to "byval as jmp_buf ptr"
 		'' jmp_buf is defined as array type in C, and arrays are passed byref in C.
@@ -1037,10 +1040,10 @@ private function hlFixSpecialParameters(byval n as ASTNODE ptr) as integer
 		'' FB doesn't support C array parameters like that, so turn them into pointers:
 		''    int a[5]  ->  byval a as long ptr
 		if n->array then
-			astDelete(n->array)
+			delete n->array
 			n->array = NULL
 			if typeGetPtrCount(n->dtype) = TYPEMAX_PTR then
-				oops("too many pointers on " + astDumpPrettyDecl(n))
+				oops("too many pointers on " + n->dumpPrettyDecl(FALSE))
 			end if
 			n->dtype = typeAddrOf(n->dtype)
 		end if
@@ -1048,27 +1051,27 @@ private function hlFixSpecialParameters(byval n as ASTNODE ptr) as integer
 	function = TRUE
 end function
 
-private sub charArrayToFixLenStr(byval n as ASTNODE ptr)
+private sub charArrayToFixLenStr(byval n as AstNode ptr)
 	assert((typeGetDtAndPtr(n->dtype) = TYPE_ZSTRING) or (typeGetDtAndPtr(n->dtype) = TYPE_WSTRING))
 	assert(n->array)
 
 	'' Use the last (inner-most) array dimension as the fixed-length string size
 	var d = n->array->tail
-	assert(d->class = ASTCLASS_DIMENSION)
+	assert(d->kind = ASTKIND_DIMENSION)
 	assert(d->expr)
 	assert(n->subtype = NULL)
 	n->subtype = d->expr
 	d->expr = NULL
-	astRemove(n->array, d)
+	n->array->remove(d)
 
 	'' If no dimensions left, remove the array type entirely
 	if n->array->head = NULL then
-		astDelete(n->array)
+		delete n->array
 		n->array = NULL
 	end if
 end sub
 
-private sub stringToByte(byval n as ASTNODE ptr)
+private sub stringToByte(byval n as AstNode ptr)
 	'' Turn zstring/wstring into byte/wchar_t, but preserve PTRs + CONSTs
 	if typeGetDt(n->dtype) = TYPE_ZSTRING then
 		n->dtype = typeSetDt(n->dtype, TYPE_BYTE)
@@ -1080,18 +1083,18 @@ private sub stringToByte(byval n as ASTNODE ptr)
 	if n->subtype then
 		'' add ARRAY if needed
 		if n->array = NULL then
-			n->array = astNew(ASTCLASS_ARRAY)
+			n->array = astNew(ASTKIND_ARRAY)
 		end if
 
 		'' add fix-len size as last (inner-most) array dimension
-		var d = astNew(ASTCLASS_DIMENSION)
+		var d = astNew(ASTKIND_DIMENSION)
 		d->expr = n->subtype
 		n->subtype = NULL
-		astAppend(n->array, d)
+		n->array->append(d)
 	end if
 end sub
 
-private sub byteToString(byval n as ASTNODE ptr)
+private sub byteToString(byval n as AstNode ptr)
 	'' Turn [u]byte/wchar_t into zstring/wstring, but preserve PTRs + CONSTs
 	if typeGetDt(n->dtype) = TYPE_WCHAR_T then
 		n->dtype = typeSetDt(n->dtype, TYPE_WSTRING)
@@ -1111,9 +1114,9 @@ end sub
 
 private sub hlFindStringOptionMatches _
 	( _
-		byval parentparent as ASTNODE ptr, _
-		byval parent as ASTNODE ptr, _
-		byval n as ASTNODE ptr, _
+		byval parentparent as AstNode ptr, _
+		byval parent as AstNode ptr, _
+		byval n as AstNode ptr, _
 		byval index as integer _
 	)
 
@@ -1140,7 +1143,7 @@ private sub hlFindStringOptionMatches _
 	var childindex = 0
 	while i
 		hlFindStringOptionMatches(parent, n, i, childindex)
-		i = i->next
+		i = i->nxt
 		childindex += 1
 	wend
 end sub
@@ -1168,24 +1171,24 @@ end sub
 ''
 type CharStringPass
 	typedefs as TypedefTable
-	declare sub walkDecls(byval n as ASTNODE ptr)
-	declare sub walkDefines(byval n as ASTNODE ptr)
+	declare sub walkDecls(byval n as AstNode ptr)
+	declare sub walkDefines(byval n as AstNode ptr)
 	declare operator let(byref as const CharStringPass) '' unimplemented
 end type
 
 #define isAffectedByNoString(n) (((n)->attrib and ASTATTRIB_NOSTRING) <> 0)
 #define isAffectedByString(n)   (((n)->attrib and ASTATTRIB_STRING  ) <> 0)
 
-private function needsStringTypedefExpansion(byval n as ASTNODE ptr) as integer
+private function needsStringTypedefExpansion(byval n as AstNode ptr) as integer
 	function = (typeGetPtrCount(n->dtype) = 0)
 end function
 
-sub CharStringPass.walkDecls(byval n as ASTNODE ptr)
+sub CharStringPass.walkDecls(byval n as AstNode ptr)
 	'' Ignore string/char literals, which also have string/char types, but
 	'' shouldn't be changed.
 	'' Ignore #defines for now; they will be processed later by walkDefines()
-	select case n->class
-	case ASTCLASS_STRING, ASTCLASS_CHAR, ASTCLASS_PPDEFINE
+	select case n->kind
+	case ASTKIND_STRING, ASTKIND_CHAR, ASTKIND_PPDEFINE
 		exit sub
 	end select
 
@@ -1226,7 +1229,7 @@ sub CharStringPass.walkDecls(byval n as ASTNODE ptr)
 		elseif n->array then
 			charArrayToFixLenStr(n)
 
-		elseif n->class <> ASTCLASS_TYPEDEF then
+		elseif n->kind <> ASTKIND_TYPEDEF then
 			stringToByte(n)
 		end if
 
@@ -1239,7 +1242,7 @@ sub CharStringPass.walkDecls(byval n as ASTNODE ptr)
 	'' If it's a single char, it can't be turned into string though, that would
 	'' be invalid FB, except in typedefs.
 	case TYPE_BYTE, TYPE_UBYTE, TYPE_WCHAR_T
-		if (n->class = ASTCLASS_TYPEDEF) or _
+		if (n->kind = ASTKIND_TYPEDEF) or _
 		   (typeGetPtrCount(n->dtype) <> 0) or _
 		   (n->array <> NULL) then
 			if isAffectedByString(n) then
@@ -1257,7 +1260,7 @@ sub CharStringPass.walkDecls(byval n as ASTNODE ptr)
 	''   string one, and should be registered like normal string typedefs.
 	'' - it can be a wchar_t typedef, in case we did stringToByte() above
 	''   (which converted wstring => wchar_t)
-	if n->class = ASTCLASS_TYPEDEF then
+	if n->kind = ASTKIND_TYPEDEF then
 		select case typeGetDtAndPtr(n->dtype)
 		case TYPE_ZSTRING, TYPE_WSTRING, TYPE_BYTE, TYPE_UBYTE, TYPE_WCHAR_T
 			typedefs.addOverwrite(n)
@@ -1278,40 +1281,40 @@ sub CharStringPass.walkDecls(byval n as ASTNODE ptr)
 	var i = n->head
 	while i
 		walkDecls(i)
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-sub CharStringPass.walkDefines(byval n as ASTNODE ptr)
+sub CharStringPass.walkDefines(byval n as AstNode ptr)
 	var i = n->head
 	while i
 
-		if (i->class = ASTCLASS_PPDEFINE) and (i->expr <> NULL) then
+		if (i->kind = ASTKIND_PPDEFINE) and (i->expr <> NULL) then
 			walkDecls(i->expr)
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
 type RenameJobs
-	'' data = TEXT ASTNODE holding the new id/alias
+	'' data = TEXT AstNode holding the new id/alias
 	table as THash = THash(6, TRUE)
-	declare function add(byval oldid as zstring ptr, byval newname as ASTNODE ptr) as integer
-	declare sub maybeApply(byval n as ASTNODE ptr)
-	declare sub walkAndApply(byval n as ASTNODE ptr)
+	declare function add(byval oldid as zstring ptr, byval newname as AstNode ptr) as integer
+	declare sub maybeApply(byval n as AstNode ptr)
+	declare sub walkAndApply(byval n as AstNode ptr)
 	declare destructor()
 	declare operator let(byref as const RenameJobs) '' unimplemented
 end type
 
-function RenameJobs.add(byval oldid as zstring ptr, byval newname as ASTNODE ptr) as integer
+function RenameJobs.add(byval oldid as zstring ptr, byval newname as AstNode ptr) as integer
 	var hash = hashHash(oldid)
 	var item = table.lookup(oldid, hash)
 	if item->s then
 		'' Allow overwriting duplicate typedefs (if both oldid/newid are the same),
 		'' but not if the newid differs (then it's a separate typedef which has to be
 		'' preserved - we can't rename A => C when already renaming A => B).
-		dim as ASTNODE ptr prevnewid = item->data
+		dim as AstNode ptr prevnewid = item->data
 		if ucase(*prevnewid->text, 1) <> ucase(*newname->text, 1) then
 			return FALSE
 		end if
@@ -1322,12 +1325,12 @@ function RenameJobs.add(byval oldid as zstring ptr, byval newname as ASTNODE ptr
 	'' UDT will become "renamed" too, and thus the type will continue to
 	'' appear in renamelists.
 	var newid = astNewTEXT(newname->text)
-	astCopyOrigId(newid, newname)
+	newid->copyOrigId(newname)
 
 	if item->s then
 		'' Free existing newid if there already is a renamejob for this oldid,
 		'' then the new newid can be stored
-		astDelete(item->data)
+		delete cptr(AstNode ptr, item->data)
 		item->data = newid
 	else
 		table.add(item, hash, oldid, newid)
@@ -1336,17 +1339,17 @@ function RenameJobs.add(byval oldid as zstring ptr, byval newname as ASTNODE ptr
 	function = TRUE
 end function
 
-sub RenameJobs.maybeApply(byval n as ASTNODE ptr)
+sub RenameJobs.maybeApply(byval n as AstNode ptr)
 	'' Is there a renamejob for this oldid?
-	dim as ASTNODE ptr newid = table.lookupDataOrNull(n->text)
+	dim as AstNode ptr newid = table.lookupDataOrNull(n->text)
 	if newid then
 		'' Change the id if needed
 		if *n->text <> *newid->text then
-			astSetText(n, newid->text)
+			n->setText(newid->text)
 		end if
 
 		'' Overwrite origid too
-		astCopyOrigId(n, newid)
+		n->copyOrigId(newid)
 
 		'' Remove attributes even if id strictly speaking doesn't change
 		n->attrib and= not (ASTATTRIB_TAGID or ASTATTRIB_GENERATEDID)
@@ -1355,14 +1358,14 @@ end sub
 
 '' Check all type names (definitions and references): If there is a rename job
 '' for an id, then change it to use the newid.
-sub RenameJobs.walkAndApply(byval n as ASTNODE ptr)
+sub RenameJobs.walkAndApply(byval n as AstNode ptr)
 	if typeGetDt(n->dtype) = TYPE_UDT then
 		assert(astIsTEXT(n->subtype))
 		maybeApply(n->subtype)
 	end if
 
-	select case n->class
-	case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM, ASTCLASS_TYPEDEF
+	select case n->kind
+	case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM, ASTKIND_TYPEDEF
 		if n->text then
 			maybeApply(n)
 		end if
@@ -1376,7 +1379,7 @@ sub RenameJobs.walkAndApply(byval n as ASTNODE ptr)
 	var i = n->head
 	while i
 		walkAndApply(i)
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
@@ -1385,23 +1388,23 @@ destructor RenameJobs()
 	for i as integer = 0 to table.room - 1
 		var item = table.items + i
 		if item->s then
-			astDelete(item->data)
+			delete cptr(AstNode ptr, item->data)
 		end if
 	next
 end destructor
 
-private sub hlSolveOutTagIds(byval n as ASTNODE ptr, byref renames as RenameJobs)
+private sub hlSolveOutTagIds(byval n as AstNode ptr, byref renames as RenameJobs)
 	var i = n->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
-		if i->class = ASTCLASS_TYPEDEF then
+		if i->kind = ASTKIND_TYPEDEF then
 			if i->dtype = TYPE_UDT then
 				assert(astIsTEXT(i->subtype))
 				'if i->subtype->attrib and ASTATTRIB_TAGID then
 				if i->subtype->attrib and ASTATTRIB_GENERATEDID then
 					if renames.add(i->subtype->text, i) then
-						astRemove(n, i)
+						n->remove(i)
 					end if
 				end if
 			end if
@@ -1416,17 +1419,17 @@ end sub
 ''    typedef struct A A;
 ''    typedef struct b B;  (FB is case-insensitive)
 '' but not if there are pointers or CONSTs involved.
-private sub hlRemoveSameIdTypedefs(byval n as ASTNODE ptr, byref renames as RenameJobs)
+private sub hlRemoveSameIdTypedefs(byval n as AstNode ptr, byref renames as RenameJobs)
 	var i = n->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
-		if i->class = ASTCLASS_TYPEDEF then
+		if i->kind = ASTKIND_TYPEDEF then
 			if i->dtype = TYPE_UDT then
 				assert(astIsTEXT(i->subtype))
 				if ucase(*i->subtype->text, 1) = ucase(*i->text, 1) then
 					if renames.add(i->subtype->text, i) then
-						astRemove(n, i)
+						n->remove(i)
 					end if
 				end if
 			end if
@@ -1490,7 +1493,7 @@ private function hLookupOrAddType(byval id as zstring ptr) as integer
 	end if
 end function
 
-private function hlCollectForwardUses(byval n as ASTNODE ptr) as integer
+private function hlCollectForwardUses(byval n as AstNode ptr) as integer
 	if typeGetDt(n->dtype) = TYPE_UDT then
 		assert(astIsTEXT(n->subtype))
 
@@ -1504,7 +1507,7 @@ private function hlCollectForwardUses(byval n as ASTNODE ptr) as integer
 		end if
 
 		'' Collect forward references from everything except typedefs
-		if n->class <> ASTCLASS_TYPEDEF then
+		if n->kind <> ASTKIND_TYPEDEF then
 			'' Type not defined yet? First forward use?
 			if (typ->definition = NULL) and (not typ->forwarduse) then
 				typ->forwarduse = TRUE
@@ -1516,18 +1519,18 @@ private function hlCollectForwardUses(byval n as ASTNODE ptr) as integer
 	'' forward references.
 	'' TODO: still add forward declarations for types that are only
 	'' referenced from #defines (probably rare in practice though)
-	function = (n->class <> ASTCLASS_PPDEFINE)
+	function = (n->kind <> ASTKIND_PPDEFINE)
 end function
 
-private sub hlScanForForwardUsedTypes(byval ast as ASTNODE ptr)
+private sub hlScanForForwardUsedTypes(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
 		'' If this is an UDT definition (tag body or typedef), register the type as "defined"
 		'' (before scanning the struct fields for potential forward-references, so that "recursive"
 		'' references to this UDT aren't seen as forward references)
-		select case i->class
-		case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM, ASTCLASS_TYPEDEF
+		select case i->kind
+		case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM, ASTKIND_TYPEDEF
 			'' Named? (enums can be anonymous)
 			if i->text then
 				'' Mark type as defined
@@ -1537,10 +1540,10 @@ private sub hlScanForForwardUsedTypes(byval ast as ASTNODE ptr)
 		end select
 
 		hl.currentdecl = i
-		astVisit(i, @hlCollectForwardUses)
+		i->visit(@hlCollectForwardUses)
 		hl.currentdecl = NULL
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
@@ -1558,52 +1561,52 @@ private function hShouldAddForwardDeclForType(byref typ as hl.TYPENODE) as integ
 end function
 
 '' Add forward decls for forward-referenced types
-private sub hlAddForwardDecls(byval ast as ASTNODE ptr)
+private sub hlAddForwardDecls(byval ast as AstNode ptr)
 	for i as integer = 0 to hl.typecount - 1
 		var typ = hl.types + i
 		if hShouldAddForwardDeclForType(*typ) then
 			var fwdid = *typ->id + "_"
-			var fwd = astNew(ASTCLASS_TYPEDEF, typ->id)
+			var fwd = astNew(ASTKIND_TYPEDEF, typ->id)
 			fwd->dtype = TYPE_UDT
 			fwd->subtype = astNewTEXT(fwdid)
 			fwd->location = typ->firstuse->location
-			astInsert(ast, fwd, typ->firstuse)
+			ast->insert(fwd, typ->firstuse)
 			if typ->definition then
 				assert(*typ->id = *typ->definition->text)
-				astSetText(typ->definition, fwdid)
+				typ->definition->setText(fwdid)
 				'' Move the type's alias/origid onto the forward decl,
 				'' since that now declares that type and should be what
 				'' appears in renamelists.
-				astTakeAliasAndOrigId(fwd, typ->definition)
+				fwd->takeAliasAndOrigId(typ->definition)
 			end if
 		end if
 	next
 end sub
 
-private function hIsUnsizedArray(byval n as ASTNODE ptr) as integer
+private function hIsUnsizedArray(byval n as AstNode ptr) as integer
 	if n->array then
-		assert(n->array->class = ASTCLASS_ARRAY)
-		assert(n->array->head->class = ASTCLASS_DIMENSION)
-		function = astHas1Child(n->array) and (n->array->head->expr->class = ASTCLASS_ELLIPSIS)
+		assert(n->array->kind = ASTKIND_ARRAY)
+		assert(n->array->head->kind = ASTKIND_DIMENSION)
+		function = n->array->has1Child() and (n->array->head->expr->kind = ASTKIND_ELLIPSIS)
 	end if
 end function
 
-private sub hFixUnsizedArray(byval ast as ASTNODE ptr, byval n as ASTNODE ptr)
+private sub hFixUnsizedArray(byval ast as AstNode ptr, byval n as AstNode ptr)
 	if hIsUnsizedArray(n) then
 		var id = *n->text
 		var tempid = "__" + id
 
 		var def = astNewPPDEFINE(id)
 		def->paramcount = 1
-		astAppend(def, astNew(ASTCLASS_MACROPARAM, "i"))
+		def->append(astNew(ASTKIND_MACROPARAM, "i"))
 		def->expr = astNewTEXT("((@" + tempid + ")[i])")
 		def->location = n->location
-		astInsert(ast, def, n)
+		ast->insert(def, n)
 
-		astTakeOrigId(def, n)
-		astRenameSymbolWithoutSettingOrigId(n, tempid)
+		def->takeOrigId(n)
+		n->renameSymbolWithoutSettingOrigId(tempid)
 
-		astDelete(n->array)
+		delete n->array
 		n->array = NULL
 
 		exit sub
@@ -1611,19 +1614,19 @@ private sub hFixUnsizedArray(byval ast as ASTNODE ptr, byval n as ASTNODE ptr)
 
 	select case typeGetDtAndPtr(n->dtype)
 	case TYPE_ZSTRING, TYPE_WSTRING
-		if n->subtype andalso (n->subtype->class = ASTCLASS_ELLIPSIS) then
+		if n->subtype andalso (n->subtype->kind = ASTKIND_ELLIPSIS) then
 			var id = *n->text
 			var tempid = "__" + id
 
 			var def = astNewPPDEFINE(id)
 			def->expr = astNewTEXT("(*cptr(" + emitFbType(typeAddrOf(n->dtype), NULL) + ", @" + tempid + "))")
 			def->location = n->location
-			astInsert(ast, def, n->next)
+			ast->insert(def, n->nxt)
 
-			astTakeOrigId(def, n)
-			astRenameSymbolWithoutSettingOrigId(n, tempid)
+			def->takeOrigId(n)
+			n->renameSymbolWithoutSettingOrigId(tempid)
 
-			astDelete(n->subtype)
+			delete n->subtype
 			n->subtype = NULL
 			stringToByte(n)
 		end if
@@ -1651,35 +1654,35 @@ end sub
 '' There's no need to worry about multi-dimensional arrays (or string arrays),
 '' because nested dimensions mustn't have unspecified size in C anyways.
 ''
-private sub hlFixUnsizedArrays(byval ast as ASTNODE ptr)
+private sub hlFixUnsizedArrays(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if i->class = ASTCLASS_VAR then
+		if i->kind = ASTKIND_VAR then
 			hFixUnsizedArray(ast, i)
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub hlDropMacroBodyScopes(byval ast as ASTNODE ptr)
+private sub hlDropMacroBodyScopes(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if (i->class = ASTCLASS_PPDEFINE) andalso _
-		   i->expr andalso (i->expr->class = ASTCLASS_SCOPEBLOCK) then
+		if (i->kind = ASTKIND_PPDEFINE) andalso _
+		   i->expr andalso (i->expr->kind = ASTKIND_SCOPEBLOCK) then
 			if i->expr->head = NULL then
-				astDelete(i->expr)
+				delete i->expr
 				i->expr = NULL
-			elseif astHas1Child(i->expr) then
-				var stmt = astClone(i->expr->head)
-				astDelete(i->expr)
+			elseif i->expr->has1Child() then
+				var stmt = i->expr->head->clone()
+				delete i->expr
 				i->expr = stmt
 			end if
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
@@ -1687,79 +1690,79 @@ end sub
 ''    #define FOO (void)f()
 '' =>
 ''    #define FOO f()
-private sub hlRemoveVoidCasts(byval ast as ASTNODE ptr)
+private sub hlRemoveVoidCasts(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if (i->class = ASTCLASS_PPDEFINE) andalso _
+		if (i->kind = ASTKIND_PPDEFINE) andalso _
 		   i->expr andalso _
-		   (i->expr->class = ASTCLASS_CAST) andalso _
+		   (i->expr->kind = ASTKIND_CAST) andalso _
 		   (i->expr->dtype = TYPE_ANY) then
-			var expr = astClone(i->expr->head)
-			astDelete(i->expr)
+			var expr = i->expr->head->clone()
+			delete i->expr
 			i->expr = expr
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub hlAddUndefsAboveDecls(byval ast as ASTNODE ptr)
+private sub hlAddUndefsAboveDecls(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if (i->class <> ASTCLASS_UNDEF) and (i->text <> NULL) then
+		if (i->kind <> ASTKIND_UNDEF) and (i->text <> NULL) then
 			if hl.api->idopt(tktokens.OPT_UNDEFBEFOREDECL).matches(i->text) then
-				var undef = astNew(ASTCLASS_UNDEF, i->text)
+				var undef = astNew(ASTKIND_UNDEF, i->text)
 				undef->location = i->location
-				astInsert(ast, undef, i)
+				ast->insert(undef, i)
 			end if
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub hlAddIfndefsAroundDecls(byval ast as ASTNODE ptr)
+private sub hlAddIfndefsAroundDecls(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
-		if (i->class <> ASTCLASS_UNDEF) andalso _
+		if (i->kind <> ASTKIND_UNDEF) andalso _
 		   i->text andalso hl.api->idopt(tktokens.OPT_IFNDEFDECL).matches(i->text) then
 			i->attrib or= ASTATTRIB_IFNDEFDECL
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
 type ParamUsageChecker
-	proc as ASTNODE ptr
+	proc as AstNode ptr
 	have_multiple_uses as integer
 	mark_as_macroparam as integer
-	declare constructor(byval proc as ASTNODE ptr, byval mark_as_macroparam as integer)
-	declare function lookupParam(byval id as zstring ptr) as ASTNODE ptr
-	declare sub onTEXT(byval n as ASTNODE ptr)
+	declare constructor(byval proc as AstNode ptr, byval mark_as_macroparam as integer)
+	declare function lookupParam(byval id as zstring ptr) as AstNode ptr
+	declare sub onTEXT(byval n as AstNode ptr)
 	declare destructor()
 end type
 
-constructor ParamUsageChecker(byval proc as ASTNODE ptr, byval mark_as_macroparam as integer)
+constructor ParamUsageChecker(byval proc as AstNode ptr, byval mark_as_macroparam as integer)
 	this.proc = proc
 	this.mark_as_macroparam = mark_as_macroparam
 end constructor
 
-function ParamUsageChecker.lookupParam(byval id as zstring ptr) as ASTNODE ptr
+function ParamUsageChecker.lookupParam(byval id as zstring ptr) as AstNode ptr
 	var param = proc->head
 	while param
 		if param->text andalso (*param->text = *id) then
 			return param
 		end if
-		param = param->next
+		param = param->nxt
 	wend
 	function = NULL
 end function
 
-sub ParamUsageChecker.onTEXT(byval n as ASTNODE ptr)
+sub ParamUsageChecker.onTEXT(byval n as AstNode ptr)
 	var param = lookupParam(n->text)
 	if param then
 		if param->attrib and ASTATTRIB_USED then
@@ -1778,13 +1781,13 @@ destructor ParamUsageChecker()
 	var param = proc->head
 	while param
 		param->attrib and= not ASTATTRIB_USED
-		param = param->next
+		param = param->nxt
 	wend
 end destructor
 
 dim shared paramusage as ParamUsageChecker ptr
 
-private function collectParamUses(byval n as ASTNODE ptr) as integer
+private function collectParamUses(byval n as AstNode ptr) as integer
 	if astIsTEXT(n) then
 		paramusage->onTEXT(n)
 	end if
@@ -1793,13 +1796,13 @@ end function
 
 '' Check that each parameter is only used once by the expression,
 '' unless -forcefunction2macro was given
-private function allowedToTurnProc2Macro(byval proc as ASTNODE ptr, byval expr as ASTNODE ptr) as integer
+private function allowedToTurnProc2Macro(byval proc as AstNode ptr, byval expr as AstNode ptr) as integer
 	if hl.api->idopt(tktokens.OPT_FORCEFUNCTION2MACRO).matches(proc->text) then
 		return TRUE
 	end if
 
 	paramusage = new ParamUsageChecker(proc, FALSE)
-	astVisit(expr, @collectParamUses)
+	expr->visit(@collectParamUses)
 	var have_multiple_uses = paramusage->have_multiple_uses
 	delete paramusage
 	paramusage = NULL
@@ -1811,14 +1814,14 @@ end function
 ''  - it must only return an expression; no other statements in the body.
 ''  - parameters (if any) can be used only once (otherwise they'd be evaluated
 ''    multiple times if turned into macro parameters).
-private sub maybeProc2Macro(byval proc as ASTNODE ptr)
-	assert(proc->class = ASTCLASS_PROC)
+private sub maybeProc2Macro(byval proc as AstNode ptr)
+	assert(proc->kind = ASTKIND_PROC)
 
 	var body = proc->expr
-	assert(body->class = ASTCLASS_SCOPEBLOCK)
+	assert(body->kind = ASTKIND_SCOPEBLOCK)
 
 	'' just a RETURN?
-	if astHasOnlyChild(body, ASTCLASS_RETURN) then
+	if body->hasOnlyChild(ASTKIND_RETURN) then
 		var ret = body->head
 
 		'' does it return an expression?
@@ -1831,56 +1834,56 @@ private sub maybeProc2Macro(byval proc as ASTNODE ptr)
 
 				'' Wrap references to macro parameters in parentheses
 				paramusage = new ParamUsageChecker(proc, TRUE)
-				astVisit(ret->head, @collectParamUses)
+				ret->head->visit(@collectParamUses)
 				delete paramusage
 				paramusage = NULL
 
-				proc->class = ASTCLASS_PPDEFINE
+				proc->kind = ASTKIND_PPDEFINE
 
 				'' Params: turn into MACROPARAMs, forget dtypes
 				var param = proc->head
 				while param
-					param->class = ASTCLASS_MACROPARAM
-					astSetType(param, TYPE_NONE, NULL)
-					param = param->next
+					param->kind = ASTKIND_MACROPARAM
+					param->setType(TYPE_NONE, NULL)
+					param = param->nxt
 				wend
 
 				'' Macro body, add cast if there is none yet
-				var expr = astClone(ret->head)
-				if astIsCastTo(expr, proc->dtype, proc->subtype) = FALSE then
-					expr = astNew(ASTCLASS_CAST, expr)
-					astSetType(expr, proc->dtype, proc->subtype)
+				var expr = ret->head->clone()
+				if expr->isCastTo(proc->dtype, proc->subtype) = FALSE then
+					expr = astNew(ASTKIND_CAST, expr)
+					expr->setType(proc->dtype, proc->subtype)
 				end if
 
 				'' Proc body -> macro body
-				astDelete(proc->expr)
+				delete proc->expr
 				proc->expr = expr
 
 				'' Forget function dtype & callconv
-				astSetType(proc, TYPE_NONE, NULL)
+				proc->setType(TYPE_NONE, NULL)
 				proc->attrib and= not ASTATTRIB__CALLCONV
 			end if
 		end if
 	end if
 end sub
 
-private sub hlProcs2Macros(byval ast as ASTNODE ptr)
+private sub hlProcs2Macros(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
 		'' proc with a body?
-		if (i->class = ASTCLASS_PROC) andalso i->expr then
+		if (i->kind = ASTKIND_PROC) andalso i->expr then
 			maybeProc2Macro(i)
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub maybeRemoveSelfDefine(byval ast as ASTNODE ptr, byval i as ASTNODE ptr, byval aliasedid as zstring ptr)
+private sub maybeRemoveSelfDefine(byval ast as AstNode ptr, byval i as AstNode ptr, byval aliasedid as zstring ptr)
 	'' Aliasing same id?
 	if *i->text = *aliasedid then
-		astRemove(ast, i)
+		ast->remove(i)
 	end if
 end sub
 
@@ -1888,17 +1891,17 @@ end sub
 ''    typedef int A;
 ''    #define A A
 '' these aren't needed/useful/possible in FB, and should be removed completely.
-private sub hlRemoveSelfDefines(byval ast as ASTNODE ptr)
+private sub hlRemoveSelfDefines(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
 		'' Process alias #defines
-		if (i->class = ASTCLASS_PPDEFINE) andalso (i->paramcount = -1) andalso i->expr then
-			select case i->expr->class
-			case ASTCLASS_TEXT
+		if (i->kind = ASTKIND_PPDEFINE) andalso (i->paramcount = -1) andalso i->expr then
+			select case i->expr->kind
+			case ASTKIND_TEXT
 				maybeRemoveSelfDefine(ast, i, i->expr->text)
-			case ASTCLASS_DATATYPE
+			case ASTKIND_DATATYPE
 				var datatype = i->expr
 				if datatype->dtype = TYPE_UDT then
 					assert(astIsTEXT(datatype->subtype))
@@ -1968,14 +1971,14 @@ type Define2Decl
 	declare operator let(byref as const Define2Decl) '' unimplemented
 	declare destructor()
 	declare sub countDecl(byval id as zstring ptr)
-	declare sub countDecls(byval ast as ASTNODE ptr)
-	declare function mayTurnDefs2Decl(byval decl as ASTNODE ptr) as integer
-	declare function exprInvolvesUndeclaredId(byval n as ASTNODE ptr) as integer
-	declare function isConstantExpr(byval n as ASTNODE ptr) as integer
-	declare sub addForward(byval aliasedid as zstring ptr, byval def as ASTNODE ptr)
-	declare sub handleAliasDefine(byval n as ASTNODE ptr, byval aliasedid as zstring ptr)
-	declare sub workDecl(byval ast as ASTNODE ptr, byval decl as ASTNODE ptr, byval insertbehind as ASTNODE ptr)
-	declare sub work(byval ast as ASTNODE ptr)
+	declare sub countDecls(byval ast as AstNode ptr)
+	declare function mayTurnDefs2Decl(byval decl as AstNode ptr) as integer
+	declare function exprInvolvesUndeclaredId(byval n as AstNode ptr) as integer
+	declare function isConstantExpr(byval n as AstNode ptr) as integer
+	declare sub addForward(byval aliasedid as zstring ptr, byval def as AstNode ptr)
+	declare sub handleAliasDefine(byval n as AstNode ptr, byval aliasedid as zstring ptr)
+	declare sub workDecl(byval ast as AstNode ptr, byval decl as AstNode ptr, byval insertbehind as AstNode ptr)
+	declare sub work(byval ast as AstNode ptr)
 end type
 
 destructor Define2Decl()
@@ -2003,7 +2006,7 @@ end sub
 '' (This has to count even #defines, at least those that may be turned into
 '' declarations later, because they themselves will be considered as alias-able
 '' declarations)
-sub Define2Decl.countDecls(byval ast as ASTNODE ptr)
+sub Define2Decl.countDecls(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
@@ -2011,28 +2014,28 @@ sub Define2Decl.countDecls(byval ast as ASTNODE ptr)
 			countDecl(i->text)
 		end if
 
-		if i->class = ASTCLASS_ENUM then
+		if i->kind = ASTKIND_ENUM then
 			'' Register enum constants too
 			var enumconst = i->head
 			while enumconst
-				if enumconst->class = ASTCLASS_CONST then
+				if enumconst->kind = ASTKIND_CONST then
 					countDecl(enumconst->text)
 				end if
-				enumconst = enumconst->next
+				enumconst = enumconst->nxt
 			wend
 		end if
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-function Define2Decl.mayTurnDefs2Decl(byval decl as ASTNODE ptr) as integer
+function Define2Decl.mayTurnDefs2Decl(byval decl as AstNode ptr) as integer
 	assert(counts.contains(decl->text, hashHash(decl->text)))
 	var count = cint(counts.lookupDataOrNull(decl->text))
 	function = (count = 1)
 end function
 
-function Define2Decl.exprInvolvesUndeclaredId(byval n as ASTNODE ptr) as integer
+function Define2Decl.exprInvolvesUndeclaredId(byval n as AstNode ptr) as integer
 	if astIsTEXT(n) then
 		if decls.contains(n->text, hashHash(n->text)) = FALSE then return TRUE
 	end if
@@ -2043,7 +2046,7 @@ function Define2Decl.exprInvolvesUndeclaredId(byval n as ASTNODE ptr) as integer
 	var i = n->head
 	while i
 		if exprInvolvesUndeclaredId(i) then return TRUE
-		i = i->next
+		i = i->nxt
 	wend
 	function = FALSE
 end function
@@ -2061,34 +2064,34 @@ end function
 ''  * string/char literals
 ''  * "sizeof(datatype)", but not "datatype"
 ''
-function Define2Decl.isConstantExpr(byval n as ASTNODE ptr) as integer
-	select case n->class
+function Define2Decl.isConstantExpr(byval n as AstNode ptr) as integer
+	select case n->kind
 	'' Atoms
-	case ASTCLASS_CONSTI, ASTCLASS_CONSTF
+	case ASTKIND_CONSTI, ASTKIND_CONSTF
 
-	case ASTCLASS_TEXT
+	case ASTKIND_TEXT
 		'' Referring to another constant?
-		dim as ASTNODE ptr decl = decls.lookupDataOrNull(n->text)
-		if (decl = NULL) orelse (decl->class <> ASTCLASS_CONST) then exit function
+		dim as AstNode ptr decl = decls.lookupDataOrNull(n->text)
+		if (decl = NULL) orelse (decl->kind <> ASTKIND_CONST) then exit function
 
 	'' UOPs
-	case ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_CAST
+	case ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_CAST
 		if isConstantExpr(n->head) = FALSE then exit function
 
 	'' BOPs
-	case ASTCLASS_LOGOR, ASTCLASS_LOGAND, _
-	     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, _
-	     ASTCLASS_EQ, ASTCLASS_NE, _
-	     ASTCLASS_LT, ASTCLASS_LE, _
-	     ASTCLASS_GT, ASTCLASS_GE, _
-	     ASTCLASS_SHL, ASTCLASS_SHR, _
-	     ASTCLASS_ADD, ASTCLASS_SUB, _
-	     ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD
+	case ASTKIND_LOGOR, ASTKIND_LOGAND, _
+	     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, _
+	     ASTKIND_EQ, ASTKIND_NE, _
+	     ASTKIND_LT, ASTKIND_LE, _
+	     ASTKIND_GT, ASTKIND_GE, _
+	     ASTKIND_SHL, ASTKIND_SHR, _
+	     ASTKIND_ADD, ASTKIND_SUB, _
+	     ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD
 		if isConstantExpr(n->head) = FALSE then exit function
 		if isConstantExpr(n->tail) = FALSE then exit function
 
 	'' IIF
-	case ASTCLASS_IIF
+	case ASTKIND_IIF
 		if isConstantExpr(n->expr) = FALSE then exit function
 		if isConstantExpr(n->head) = FALSE then exit function
 		if isConstantExpr(n->tail) = FALSE then exit function
@@ -2100,7 +2103,7 @@ function Define2Decl.isConstantExpr(byval n as ASTNODE ptr) as integer
 	function = TRUE
 end function
 
-sub Define2Decl.addForward(byval aliasedid as zstring ptr, byval def as ASTNODE ptr)
+sub Define2Decl.addForward(byval aliasedid as zstring ptr, byval def as AstNode ptr)
 	var aliasedidhash = hashHash(aliasedid)
 	var item = forwards.lookup(aliasedid, aliasedidhash)
 	if item->s then
@@ -2112,29 +2115,31 @@ sub Define2Decl.addForward(byval aliasedid as zstring ptr, byval def as ASTNODE 
 	end if
 end sub
 
-private sub copyAttribsTypeEtcAndChooseAlias(byval n as ASTNODE ptr, byval decl as ASTNODE ptr)
-	n->class = decl->class
+private sub copyAttribsTypeEtcAndChooseAlias(byval n as AstNode ptr, byval decl as AstNode ptr)
+	n->kind = decl->kind
 	n->attrib or= decl->attrib and (ASTATTRIB_DLLIMPORT or ASTATTRIB__CALLCONV or ASTATTRIB_EXTERN)
-	astSetType(n, decl->dtype, decl->subtype)
-	n->array = astClone(decl->array)
-	astAppend(n, astCloneChildren(decl))
-	astSetAlias(n, iif(decl->alias, decl->alias, decl->text))
+	n->setType(decl->dtype, decl->subtype)
+	if decl->array then
+		n->array = decl->array->clone()
+	end if
+	n->append(decl->cloneChildren())
+	n->setAlias(iif(decl->alias_, decl->alias_, decl->text))
 end sub
 
-private sub astDropExpr(byval n as ASTNODE ptr)
-	astDelete(n->expr)
+private sub astDropExpr(byval n as AstNode ptr)
+	delete n->expr
 	n->expr = NULL
 end sub
 
-private sub turnDefine2Decl(byval n as ASTNODE ptr, byval decl as ASTNODE ptr)
+private sub turnDefine2Decl(byval n as AstNode ptr, byval decl as AstNode ptr)
 	'' This #define aliases a previous declaration
-	select case decl->class
-	case ASTCLASS_CONST
+	select case decl->kind
+	case ASTKIND_CONST
 		'' const A = ...
 		'' #define B A    =>  const B = A
-		n->class = ASTCLASS_CONST
+		n->kind = ASTKIND_CONST
 
-	case ASTCLASS_TYPEDEF, ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+	case ASTKIND_TYPEDEF, ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 		'' type A as ...
 		'' #define B A    =>  type B as A
 		'' Note: typedef-style #defines (with DATATYPE body) are handled
@@ -2142,13 +2147,15 @@ private sub turnDefine2Decl(byval n as ASTNODE ptr, byval decl as ASTNODE ptr)
 		'' happen, if a define body refers to a struct but wasn't parsed
 		'' as data type - i.e. because it's just the tag id, and the
 		'' "struct" keyword was missing.
-		n->class = ASTCLASS_TYPEDEF
+		n->kind = ASTKIND_TYPEDEF
 		n->dtype = TYPE_UDT
 		n->subtype = astNewTEXT(decl->text)
-		n->array = astClone(decl->array)
+		if decl->array then
+			n->array = decl->array->clone()
+		end if
 		astDropExpr(n)
 
-	case ASTCLASS_PROC
+	case ASTKIND_PROC
 		'' declare sub/function A
 		'' declare sub/function C alias "X"
 		'' #define B A    =>    declare sub/function B alias "A"
@@ -2156,7 +2163,7 @@ private sub turnDefine2Decl(byval n as ASTNODE ptr, byval decl as ASTNODE ptr)
 		copyAttribsTypeEtcAndChooseAlias(n, decl)
 		astDropExpr(n)
 
-	case ASTCLASS_VAR
+	case ASTKIND_VAR
 		if decl->attrib and (ASTATTRIB_LOCAL or ASTATTRIB_STATIC) then exit sub
 
 		'' extern A as ...
@@ -2168,19 +2175,19 @@ private sub turnDefine2Decl(byval n as ASTNODE ptr, byval decl as ASTNODE ptr)
 	end select
 end sub
 
-private sub turnDefine2Typedef(byval n as ASTNODE ptr)
+private sub turnDefine2Typedef(byval n as AstNode ptr)
 	'' #define A dtype    =>    type A as dtype
 	var datatype = n->expr
-	assert(datatype->class = ASTCLASS_DATATYPE)
-	n->class = ASTCLASS_TYPEDEF
+	assert(datatype->kind = ASTKIND_DATATYPE)
+	n->kind = ASTKIND_TYPEDEF
 	n->dtype = datatype->dtype
 	n->subtype = datatype->subtype
 	datatype->subtype = NULL
 	astDropExpr(n)
 end sub
 
-sub Define2Decl.handleAliasDefine(byval def as ASTNODE ptr, byval aliasedid as zstring ptr)
-	dim as ASTNODE ptr decl = decls.lookupDataOrNull(aliasedid)
+sub Define2Decl.handleAliasDefine(byval def as AstNode ptr, byval aliasedid as zstring ptr)
+	dim as AstNode ptr decl = decls.lookupDataOrNull(aliasedid)
 	if decl then
 		turnDefine2Decl(def, decl)
 	else
@@ -2193,7 +2200,7 @@ sub Define2Decl.handleAliasDefine(byval def as ASTNODE ptr, byval aliasedid as z
 	end if
 end sub
 
-sub Define2Decl.workDecl(byval ast as ASTNODE ptr, byval decl as ASTNODE ptr, byval insertbehind as ASTNODE ptr)
+sub Define2Decl.workDecl(byval ast as AstNode ptr, byval decl as AstNode ptr, byval insertbehind as AstNode ptr)
 	if mayTurnDefs2Decl(decl) = FALSE then exit sub
 
 	'' Check whether we saw an alias #define for this declaration before
@@ -2201,13 +2208,13 @@ sub Define2Decl.workDecl(byval ast as ASTNODE ptr, byval decl as ASTNODE ptr, by
 	if item->s then
 		dim info as ForwardInfo ptr = item->data
 		if info then
-			var insertbefore = insertbehind->next
+			var insertbefore = insertbehind->nxt
 
 			'' Move the collected #defines behind the declaration and process them
 			for i as integer = 0 to info->defcount - 1
 				var aliasdef = info->defs[i]
-				astUnlink(ast, aliasdef)
-				astInsert(ast, aliasdef, insertbefore)
+				ast->unlink(aliasdef)
+				ast->insert(aliasdef, insertbefore)
 
 				'' This may even move the #define into a different header file
 				aliasdef->location = insertbehind->location
@@ -2225,21 +2232,21 @@ sub Define2Decl.workDecl(byval ast as ASTNODE ptr, byval decl as ASTNODE ptr, by
 	decls.addOverwrite(decl->text, decl)
 end sub
 
-sub Define2Decl.work(byval ast as ASTNODE ptr)
+sub Define2Decl.work(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
 
 		'' Process alias #defines
-		if (i->class = ASTCLASS_PPDEFINE) andalso (i->paramcount = -1) andalso i->expr then
-			select case i->expr->class
-			case ASTCLASS_TEXT
+		if (i->kind = ASTKIND_PPDEFINE) andalso (i->paramcount = -1) andalso i->expr then
+			select case i->expr->kind
+			case ASTKIND_TEXT
 				handleAliasDefine(i, i->expr->text)
-			case ASTCLASS_DATATYPE
+			case ASTKIND_DATATYPE
 				turnDefine2Typedef(i)
 			case else
 				'' Body is a constant expression?
 				if isConstantExpr(i->expr) andalso (not exprInvolvesUndeclaredId(i->expr)) then
-					i->class = ASTCLASS_CONST
+					i->kind = ASTKIND_CONST
 				end if
 			end select
 		end if
@@ -2247,35 +2254,35 @@ sub Define2Decl.work(byval ast as ASTNODE ptr)
 		'' Register declarations that can be aliased via #defines
 		'' (This also handles declarations produced above by turning
 		'' #defines into declarations)
-		select case i->class
-		case ASTCLASS_CONST, ASTCLASS_PROC, ASTCLASS_TYPEDEF, _
-		     ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
+		select case i->kind
+		case ASTKIND_CONST, ASTKIND_PROC, ASTKIND_TYPEDEF, _
+		     ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
 			if i->text then
 				workDecl(ast, i, i)
 			end if
 
-			if i->class = ASTCLASS_ENUM then
+			if i->kind = ASTKIND_ENUM then
 				'' Register enum constants too
 				var enumconst = i->head
 				while enumconst
-					if enumconst->class = ASTCLASS_CONST then
+					if enumconst->kind = ASTKIND_CONST then
 						workDecl(ast, enumconst, i)
 					end if
-					enumconst = enumconst->next
+					enumconst = enumconst->nxt
 				wend
 			end if
 
-		case ASTCLASS_VAR
+		case ASTKIND_VAR
 			if (i->attrib and (ASTATTRIB_LOCAL or ASTATTRIB_STATIC)) = 0 then
 				workDecl(ast, i, i)
 			end if
 		end select
 
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-private sub hlDefine2Decl(byval ast as ASTNODE ptr)
+private sub hlDefine2Decl(byval ast as AstNode ptr)
 	dim pass as Define2Decl
 	pass.countDecls(ast)
 	pass.work(ast)
@@ -2284,10 +2291,10 @@ end sub
 type EmittedIds
 	ids as THash = THash(8, TRUE) '' data = boolean: id ever used as FB keyword?
 	declare operator let(byref as const EmittedIds) '' unimplemented
-	declare sub collect(byval ast as ASTNODE ptr)
+	declare sub collect(byval ast as AstNode ptr)
 end type
 
-sub EmittedIds.collect(byval ast as ASTNODE ptr)
+sub EmittedIds.collect(byval ast as AstNode ptr)
 	dim fbcode as emit.CodeGen
 	fbcode.emitCode(ast)
 	for i as integer = 0 to fbcode.tokens.count - 1
@@ -2335,13 +2342,13 @@ private function macroParamConflictsWithIdInBody(byref param as const string, by
 	return FALSE
 end function
 
-private function macroParamConflictsWithMacroParam(byref param as const string, byval macro as ASTNODE ptr) as integer
+private function macroParamConflictsWithMacroParam(byref param as const string, byval macro as AstNode ptr) as integer
 	var otherparam = macro->head
 	while otherparam
 		if idsDifferInCaseOnly(*otherparam->text, param) then
 			return TRUE
 		end if
-		otherparam = otherparam->next
+		otherparam = otherparam->nxt
 	wend
 	return FALSE
 end function
@@ -2349,7 +2356,7 @@ end function
 type MacroParamRenamer
 	as string oldname, newname
 	declare constructor(byref oldname as string, byref newname as string)
-	declare sub walk(byval n as ASTNODE ptr)
+	declare sub walk(byval n as AstNode ptr)
 end type
 
 constructor MacroParamRenamer(byref oldname as string, byref newname as string)
@@ -2357,10 +2364,10 @@ constructor MacroParamRenamer(byref oldname as string, byref newname as string)
 	this.newname = newname
 end constructor
 
-sub MacroParamRenamer.walk(byval n as ASTNODE ptr)
-	if n->class = ASTCLASS_TEXT then
+sub MacroParamRenamer.walk(byval n as AstNode ptr)
+	if n->kind = ASTKIND_TEXT then
 		if *n->text = oldname then
-			astSetText(n, newname)
+			n->setText(newname)
 		end if
 	end if
 
@@ -2371,7 +2378,7 @@ sub MacroParamRenamer.walk(byval n as ASTNODE ptr)
 	var i = n->head
 	while i
 		walk(i)
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
@@ -2380,7 +2387,7 @@ end sub
 '' e.g. typedefs, variables, function names) or FB keywords used in the macro
 '' body.
 ''
-private sub autoRenameConflictingMacroParams(byval macro as ASTNODE ptr)
+private sub autoRenameConflictingMacroParams(byval macro as AstNode ptr)
 	var found_conflict = FALSE
 	do
 		'' Collect ids used in the macro body
@@ -2407,14 +2414,14 @@ private sub autoRenameConflictingMacroParams(byval macro as ASTNODE ptr)
 			   (not macroParamConflictsWithMacroParam(paramname, macro)) then
 				'' Auto-rename
 				var newname = paramname + "_"
-				astSetText(param, newname)
+				param->setText(newname)
 				scope
 					dim renamer as MacroParamRenamer = MacroParamRenamer(paramname, newname)
 					renamer.walk(macro->expr)
 				end scope
 				found_conflict = TRUE
 			end if
-			param = param->next
+			param = param->nxt
 		loop while param
 
 		'sleep
@@ -2422,23 +2429,23 @@ private sub autoRenameConflictingMacroParams(byval macro as ASTNODE ptr)
 	loop while found_conflict
 end sub
 
-private sub hlAutoRenameConflictingMacroParams(byval ast as ASTNODE ptr)
+private sub hlAutoRenameConflictingMacroParams(byval ast as AstNode ptr)
 	var i = ast->head
 	while i
-		if i->class = ASTCLASS_PPDEFINE then
+		if i->kind = ASTKIND_PPDEFINE then
 			if (i->expr <> NULL) and (i->paramcount > 0) then
 				autoRenameConflictingMacroParams(i)
 			end if
 		end if
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-private function hlCountCallConvs(byval n as ASTNODE ptr) as integer
-	select case n->class
-	case ASTCLASS_PROC
+private function hlCountCallConvs(byval n as AstNode ptr) as integer
+	select case n->kind
+	case ASTKIND_PROC
 		hl.need_extern = TRUE
 		if n->attrib and ASTATTRIB_STDCALL then
 			hl.stdcalls += 1
@@ -2446,16 +2453,16 @@ private function hlCountCallConvs(byval n as ASTNODE ptr) as integer
 			assert(n->attrib and ASTATTRIB_CDECL)
 			hl.cdecls += 1
 		end if
-	case ASTCLASS_VAR
+	case ASTKIND_VAR
 		hl.need_extern or= ((n->attrib and ASTATTRIB_EXTERN) <> 0) or _
 		                   ((n->attrib and ASTATTRIB_STATIC) = 0)
 	end select
 	'' Don't count code in macro bodies
-	function = (n->class <> ASTCLASS_PPDEFINE)
+	function = (n->kind <> ASTKIND_PPDEFINE)
 end function
 
-private function hlHideCallConv(byval n as ASTNODE ptr) as integer
-	if n->class = ASTCLASS_PROC then
+private function hlHideCallConv(byval n as AstNode ptr) as integer
+	if n->kind = ASTKIND_PROC then
 		if n->attrib and hl.mostusedcallconv then
 			n->attrib or= ASTATTRIB_HIDECALLCONV
 		end if
@@ -2463,7 +2470,7 @@ private function hlHideCallConv(byval n as ASTNODE ptr) as integer
 	'' Don't hide callconvs in macro bodies, otherwise they could
 	'' end up using the wrong callconv if expanded outside the
 	'' header's Extern block.
-	function = (n->class <> ASTCLASS_PPDEFINE)
+	function = (n->kind <> ASTKIND_PPDEFINE)
 end function
 
 '' *.h CRT/POSIX headers for which FB has corresponding crt/*.bi versions
@@ -2479,7 +2486,7 @@ type IncludePass
 	fbcrtheaderhash as THash = THash(5, TRUE)
 	declare constructor()
 	declare sub translateHeaderFileName(byref filename as string)
-	declare sub work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiOptions)
+	declare sub work(byval ast as AstNode ptr, byref bioptions as ApiSpecificBiOptions)
 	declare operator let(byref as const IncludePass) '' unimplemented
 end type
 
@@ -2503,12 +2510,12 @@ sub IncludePass.translateHeaderFileName(byref filename as string)
 	filename += ".bi"
 end sub
 
-sub IncludePass.work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiOptions)
+sub IncludePass.work(byval ast as AstNode ptr, byref bioptions as ApiSpecificBiOptions)
 	'' Find node above which new #includes should be inserted. This should
 	'' always be behind existing #includes at the top.
 	var top = ast->head
-	while top andalso (top->class = ASTCLASS_PPINCLUDE)
-		top = top->next
+	while top andalso (top->kind = ASTKIND_PPINCLUDE)
+		top = top->nxt
 	wend
 
 	'' Start at this "top" node, otherwise we'd run an infinite loop trying
@@ -2518,14 +2525,14 @@ sub IncludePass.work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiO
 	'' to bottom via the "next" pointers).
 	var i = top
 	while i
-		var nxt = i->next
+		var nxt = i->nxt
 
 		'' #include?
-		if i->class = ASTCLASS_PPINCLUDE then
+		if i->kind = ASTKIND_PPINCLUDE then
 			'' Move to top (outside of Extern block), without changing the order
 			assert(i <> top)
-			astUnlink(ast, i)
-			astInsert(ast, i, top)
+			ast->unlink(i)
+			ast->insert(i, top)
 		end if
 
 		i = nxt
@@ -2533,23 +2540,23 @@ sub IncludePass.work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiO
 
 	'' Add #includes from -addinclude options
 	if bioptions.addincludes then
-		astInsert(ast, bioptions.addincludes, top)
+		ast->insert(bioptions.addincludes, top)
 		bioptions.addincludes = NULL
 	end if
 
 	'' For each #include at the top, apply -removeinclude and remap *.h => *.bi
 	i = ast->head
 	while i <> top
-		var nxt = i->next
+		var nxt = i->nxt
 
 		'' #include?
-		if i->class = ASTCLASS_PPINCLUDE then
+		if i->kind = ASTKIND_PPINCLUDE then
 			var filename = *i->text
 			if hl.api->removeinclude.contains(filename, hashHash(filename)) then
-				astRemove(ast, i)
+				ast->remove(i)
 			else
 				translateHeaderFileName(filename)
-				astSetText(i, filename)
+				i->setText(filename)
 			end if
 		end if
 
@@ -2561,14 +2568,14 @@ sub IncludePass.work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiO
 
 	i = ast->head
 	while i <> top
-		var nxt = i->next
+		var nxt = i->nxt
 
 		'' #include?
-		if i->class = ASTCLASS_PPINCLUDE then
+		if i->kind = ASTKIND_PPINCLUDE then
 			var hash = hashHash(i->text)
 			var item = includes.lookup(i->text, hash)
 			if item->s then
-				astRemove(ast, i)
+				ast->remove(i)
 			else
 				includes.add(item, hash, i->text, NULL)
 			end if
@@ -2578,7 +2585,7 @@ sub IncludePass.work(byval ast as ASTNODE ptr, byref bioptions as ApiSpecificBiO
 	wend
 end sub
 
-private function hlSearchSpecialDtypes(byval n as ASTNODE ptr) as integer
+private function hlSearchSpecialDtypes(byval n as AstNode ptr) as integer
 	select case typeGetDt(n->dtype)
 	case TYPE_CLONG, TYPE_CULONG
 		hl.uses_clong = TRUE
@@ -2588,30 +2595,30 @@ private function hlSearchSpecialDtypes(byval n as ASTNODE ptr) as integer
 	function = TRUE
 end function
 
-private function hlBuildRenameList(byval n as ASTNODE ptr) as ASTNODE ptr
+private function hlBuildRenameList(byval n as AstNode ptr) as AstNode ptr
 	var list = astNewGROUP()
 
 	var i = n->head
 	while i
 
 		if (i->text <> NULL) and (i->origid <> NULL) and _
-		   (i->class <> ASTCLASS_UNDEF) then
-			var msg = astDumpPrettyClass(i->class)
+		   (i->kind <> ASTKIND_UNDEF) then
+			var msg = astDumpPrettyKind(i->kind)
 			msg += " " + *i->origid + " => " + *i->text
-			astAppend(list, astNewTEXT(msg))
+			list->append(astNewTEXT(msg))
 		end if
 
 		'' TODO: recurse into struct/union if renaming fields...
-		''astAppend(list, hlBuildRenameList(i))
+		''list->append(hlBuildRenameList(i))
 
-		if i->class = ASTCLASS_ENUM then
+		if i->kind = ASTKIND_ENUM then
 			'' Handle enumconsts - they're in the same scope as the enum itself anyways,
 			'' so we don't need to worry about making a nested renamelist for the enum.
-			astAppend(list, hlBuildRenameList(i))
+			list->append(hlBuildRenameList(i))
 		end if
 
 
-		i = i->next
+		i = i->nxt
 	wend
 
 	function = list
@@ -2620,49 +2627,49 @@ end function
 '' while (0) ...      =>   scope : ... : end scope
 '' do ... while (0);  =>   scope : ... : end scope
 '' (commonly used construct in C headers)
-private function hlTurnWhile0IntoScope(byval n as ASTNODE ptr) as integer
-	select case n->class
-	case ASTCLASS_DOWHILE, ASTCLASS_WHILE
+private function hlTurnWhile0IntoScope(byval n as AstNode ptr) as integer
+	select case n->kind
+	case ASTKIND_DOWHILE, ASTKIND_WHILE
 		'' Loop condition is just a 0?
-		if astIsConst0(n->expr) then
-			astDelete(n->expr)
+		if n->expr->isConst0() then
+			delete n->expr
 			n->expr = NULL
-			n->class = ASTCLASS_SCOPEBLOCK
+			n->kind = ASTKIND_SCOPEBLOCK
 		end if
 	end select
 	function = TRUE
 end function
 
-private function hlSolveOutUnnecessaryScopeBlocks(byval n as ASTNODE ptr) as integer
-	select case n->class
-	case ASTCLASS_SCOPEBLOCK, ASTCLASS_DOWHILE, ASTCLASS_WHILE, _
-	     ASTCLASS_IFPART, ASTCLASS_ELSEIFPART, ASTCLASS_ELSEPART
+private function hlSolveOutUnnecessaryScopeBlocks(byval n as AstNode ptr) as integer
+	select case n->kind
+	case ASTKIND_SCOPEBLOCK, ASTKIND_DOWHILE, ASTKIND_WHILE, _
+	     ASTKIND_IFPART, ASTKIND_ELSEIFPART, ASTKIND_ELSEPART
 		'' Contains just a SCOPEBLOCK?
-		while astHasOnlyChild(n, ASTCLASS_SCOPEBLOCK)
+		while n->hasOnlyChild(ASTKIND_SCOPEBLOCK)
 			'' Move scope block's children in place of the scope block
-			astAppend(n, astCloneChildren(n->head))
-			astRemove(n, n->head)
+			n->append(n->head->cloneChildren())
+			n->remove(n->head)
 		wend
 
-	case ASTCLASS_PPDEFINE
+	case ASTKIND_PPDEFINE
 		'' If the macro body is a scope block that contains just one if/loop block,
 		'' then remove the scope block
 		do
 			if n->expr = NULL then exit do
-			if n->expr->class <> ASTCLASS_SCOPEBLOCK then exit do
+			if n->expr->kind <> ASTKIND_SCOPEBLOCK then exit do
 
 			var scopeblock = n->expr
 
 			'' Exactly one statement?
-			if astHas1Child(scopeblock) = FALSE then exit do
+			if scopeblock->has1Child() = FALSE then exit do
 
 			'' It's a scope/if/loop?
-			select case scopeblock->head->class
-			case ASTCLASS_SCOPEBLOCK, ASTCLASS_IFBLOCK, ASTCLASS_DOWHILE, ASTCLASS_WHILE
+			select case scopeblock->head->kind
+			case ASTKIND_SCOPEBLOCK, ASTKIND_IFBLOCK, ASTKIND_DOWHILE, ASTKIND_WHILE
 				'' Remove the outer scope block, and directly use the inner block as macro body.
 				var stmt = scopeblock->head
-				astUnlink(scopeblock, stmt)
-				astDelete(n->expr)
+				scopeblock->unlink(stmt)
+				delete n->expr
 				n->expr = stmt
 
 			case else
@@ -2674,32 +2681,32 @@ private function hlSolveOutUnnecessaryScopeBlocks(byval n as ASTNODE ptr) as int
 	function = TRUE
 end function
 
-private function hlCreateElseIfs(byval n as ASTNODE ptr) as integer
-	if n->class = ASTCLASS_IFBLOCK then
+private function hlCreateElseIfs(byval n as AstNode ptr) as integer
+	if n->kind = ASTKIND_IFBLOCK then
 		do
 			'' Has an else part?
 			var elsepart = n->tail
-			if (elsepart = NULL) orelse (elsepart->class <> ASTCLASS_ELSEPART) then
+			if (elsepart = NULL) orelse (elsepart->kind <> ASTKIND_ELSEPART) then
 				exit do
 			end if
 
 			'' Contains just an IFBLOCK?
-			if astHasOnlyChild(elsepart, ASTCLASS_IFBLOCK) = FALSE then
+			if elsepart->hasOnlyChild(ASTKIND_IFBLOCK) = FALSE then
 				exit do
 			end if
 
 			var nestedif = elsepart->head
-			assert(nestedif->head->class = ASTCLASS_IFPART)
+			assert(nestedif->head->kind = ASTKIND_IFPART)
 
 			'' Copy the if/elseif/else parts from the nested ifblock
 			'' into the parent ifblock, behind the else part
-			astAppend(n, astCloneChildren(nestedif))
+			n->append(nestedif->cloneChildren())
 
 			'' Turn the added if part into an elseif
-			assert(elsepart->next->class = ASTCLASS_IFPART)
-			elsepart->next->class = ASTCLASS_ELSEIFPART
+			assert(elsepart->nxt->kind = ASTKIND_IFPART)
+			elsepart->nxt->kind = ASTKIND_ELSEIFPART
 
-			astRemove(n, elsepart)
+			n->remove(elsepart)
 		loop
 	end if
 	function = TRUE
@@ -2707,9 +2714,9 @@ end function
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-private function hIsPPElseOrEnd(byval n as ASTNODE ptr) as integer
-	select case n->class
-	case ASTCLASS_PPELSEIF, ASTCLASS_PPELSE, ASTCLASS_PPENDIF
+private function hIsPPElseOrEnd(byval n as AstNode ptr) as integer
+	select case n->kind
+	case ASTKIND_PPELSEIF, ASTKIND_PPELSE, ASTKIND_PPENDIF
 		function = TRUE
 	end select
 end function
@@ -2718,41 +2725,41 @@ private function hAreSimilar(byval a as integer, byval b as integer) as integer
 	if a = b then return TRUE
 
 	'' FBCODE is probably ok
-	if (a = ASTCLASS_FBCODE) or (b = ASTCLASS_FBCODE) then return TRUE
+	if (a = ASTKIND_FBCODE) or (b = ASTKIND_FBCODE) then return TRUE
 
 	'' Treat #defines/constants as equal, because they're often the same thing anyways
 	#define check(x, y) if ((a = x) and (b = y)) or ((a = y) and (b = x)) then return TRUE
-	check(ASTCLASS_PPDEFINE, ASTCLASS_CONST)
+	check(ASTKIND_PPDEFINE, ASTKIND_CONST)
 
 	function = FALSE
 end function
 
-private function hSkipStatementsInARow(byval i as ASTNODE ptr) as ASTNODE ptr
-	select case i->class
+private function hSkipStatementsInARow(byval i as AstNode ptr) as AstNode ptr
+	select case i->kind
 	'' All parts of one #if block
-	case ASTCLASS_PPIF
+	case ASTKIND_PPIF
 		do
-			i = i->next
+			i = i->nxt
 		loop while i andalso hIsPPElseOrEnd(i)
 		return i
 
-	case ASTCLASS_PPINCLUDE, ASTCLASS_INCLIB
-		var astclass = i->class
+	case ASTKIND_PPINCLUDE, ASTKIND_INCLIB
+		var astkind = i->kind
 		do
-			i = i->next
-		loop while i andalso (i->class = astclass)
+			i = i->nxt
+		loop while i andalso (i->kind = astkind)
 		return i
 
-	case ASTCLASS_PRAGMAONCE, ASTCLASS_RENAMELIST, ASTCLASS_TITLE, _
-	     ASTCLASS_EXTERNBLOCKBEGIN, ASTCLASS_EXTERNBLOCKEND, _
-	     ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM, _
-	     ASTCLASS_IFBLOCK, ASTCLASS_DOWHILE, ASTCLASS_WHILE
-		return i->next
+	case ASTKIND_PRAGMAONCE, ASTKIND_RENAMELIST, ASTKIND_TITLE, _
+	     ASTKIND_EXTERNBLOCKBEGIN, ASTKIND_EXTERNBLOCKEND, _
+	     ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM, _
+	     ASTKIND_IFBLOCK, ASTKIND_DOWHILE, ASTKIND_WHILE
+		return i->nxt
 
 	'' Procedure body?
-	case ASTCLASS_PROC
+	case ASTKIND_PROC
 		if i->expr then
-			return i->next
+			return i->nxt
 		end if
 	end select
 
@@ -2760,28 +2767,28 @@ private function hSkipStatementsInARow(byval i as ASTNODE ptr) as ASTNODE ptr
 	'' long as it's the same kind. However, small deviations are allowed,
 	'' if it's just a few declarations in the middle of a bigger block.
 	const BIGTHRESHOLD = 3
-	var dominantclass = -1
+	var dominantkind = -1
 	do
-		var blockclass = i->class
+		var blockkind = i->kind
 		var length = 0
 		var nxt = i
 		do
-			select case nxt->class
-			case ASTCLASS_PPIF, ASTCLASS_INCLIB, ASTCLASS_PPINCLUDE, _
-			     ASTCLASS_PRAGMAONCE, ASTCLASS_RENAMELIST, ASTCLASS_TITLE, _
-			     ASTCLASS_EXTERNBLOCKBEGIN, ASTCLASS_EXTERNBLOCKEND, _
-			     ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM, _
-			     ASTCLASS_IFBLOCK, ASTCLASS_DOWHILE, ASTCLASS_WHILE
+			select case nxt->kind
+			case ASTKIND_PPIF, ASTKIND_INCLIB, ASTKIND_PPINCLUDE, _
+			     ASTKIND_PRAGMAONCE, ASTKIND_RENAMELIST, ASTKIND_TITLE, _
+			     ASTKIND_EXTERNBLOCKBEGIN, ASTKIND_EXTERNBLOCKEND, _
+			     ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM, _
+			     ASTKIND_IFBLOCK, ASTKIND_DOWHILE, ASTKIND_WHILE
 				exit do
-			case ASTCLASS_PROC
+			case ASTKIND_PROC
 				if nxt->expr then
 					exit do
 				end if
 			end select
 
 			length += 1
-			nxt = nxt->next
-		loop while nxt andalso hAreSimilar(blockclass, nxt->class)
+			nxt = nxt->nxt
+		loop while nxt andalso hAreSimilar(blockkind, nxt->kind)
 
 		'' Next statement can't be in a block?
 		if length = 0 then
@@ -2791,10 +2798,10 @@ private function hSkipStatementsInARow(byval i as ASTNODE ptr) as ASTNODE ptr
 		'' Block dominant due to its size?
 		if length >= BIGTHRESHOLD then
 			'' First?
-			if dominantclass = -1 then
-				dominantclass = i->class
-			'' Others must have a similar astclass
-			elseif hAreSimilar(dominantclass, i->class) = FALSE then
+			if dominantkind = -1 then
+				dominantkind = i->kind
+			'' Others must have a similar astkind
+			elseif hAreSimilar(dominantkind, i->kind) = FALSE then
 				exit do
 			end if
 		end if
@@ -2822,24 +2829,24 @@ end function
 ''
 ''  * #pragma once/extern/end extern should be separated from the context
 ''
-sub hlAutoAddDividers(byval ast as ASTNODE ptr)
+sub hlAutoAddDividers(byval ast as AstNode ptr)
 	'' Recurse where needed
 	scope
 		var i = ast->head
 		while i
-			select case i->class
-			case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM, _
-			     ASTCLASS_PPIF, ASTCLASS_PPELSEIF, ASTCLASS_PPELSE, _
-			     ASTCLASS_SCOPEBLOCK, ASTCLASS_DOWHILE, ASTCLASS_WHILE
+			select case i->kind
+			case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM, _
+			     ASTKIND_PPIF, ASTKIND_PPELSEIF, ASTKIND_PPELSE, _
+			     ASTKIND_SCOPEBLOCK, ASTKIND_DOWHILE, ASTKIND_WHILE
 				hlAutoAddDividers(i)
-			case ASTCLASS_IFBLOCK
+			case ASTKIND_IFBLOCK
 				var part = i->head
 				while part
 					hlAutoAddDividers(part)
-					part = part->next
+					part = part->nxt
 				wend
 			end select
-			i = i->next
+			i = i->nxt
 		wend
 	end scope
 
@@ -2855,7 +2862,7 @@ sub hlAutoAddDividers(byval ast as ASTNODE ptr)
 
 			'' Insert divider behind the block, to separate it from the next
 			'' block. The divider isn't treated as part of a block.
-			astInsert(ast, astNew(ASTCLASS_DIVIDER), i)
+			ast->insert(astNew(ASTKIND_DIVIDER), i)
 		loop
 	end if
 end sub
@@ -2866,9 +2873,9 @@ end sub
 '' Global (entire AST of an API) highlevel transformations, intended to run 1st
 ''
 '' If any declarations are added to the AST here, care must be taken to set the
-'' ASTNODE.location, so they can be assigned to the proper output .bi file.
+'' AstNode.location, so they can be assigned to the proper output .bi file.
 ''
-sub hlGlobal(byval ast as ASTNODE ptr, byref api as ApiInfo)
+sub hlGlobal(byval ast as AstNode ptr, byref api as ApiInfo)
 	hl.api = @api
 
 	if api.removeEmptyReservedDefines then
@@ -2880,11 +2887,11 @@ sub hlGlobal(byval ast as ASTNODE ptr, byref api as ApiInfo)
 	end if
 
 	if api.idopt(tktokens.OPT_REMOVEPROC).nonEmpty then
-		hlApplyRemoveOption(ast, ASTCLASS_PROC, tktokens.OPT_REMOVEPROC)
+		hlApplyRemoveOption(ast, ASTKIND_PROC, tktokens.OPT_REMOVEPROC)
 	end if
 
 	if api.idopt(tktokens.OPT_REMOVEVAR).nonEmpty then
-		hlApplyRemoveOption(ast, ASTCLASS_VAR, tktokens.OPT_REMOVEVAR)
+		hlApplyRemoveOption(ast, ASTKIND_VAR, tktokens.OPT_REMOVEVAR)
 	end if
 
 	if api.idopt(tktokens.OPT_REMOVE1ST).nonEmpty then
@@ -2899,11 +2906,11 @@ sub hlGlobal(byval ast as ASTNODE ptr, byref api as ApiInfo)
 		hlApplyDropProcBodyOptions(ast)
 	end if
 
-	astVisit(ast, @hlSetArraySizes)
+	ast->visit(@hlSetArraySizes)
 
 	'' Apply -rename* options, if any
 	if api.have_renames then
-		astVisit(ast, @hlApplyRenameOption)
+		ast->visit(@hlApplyRenameOption)
 	end if
 
 	'' Remove exact-alias #defines (e.g. <#define A A>), they're neither
@@ -2938,7 +2945,7 @@ sub hlGlobal(byval ast as ASTNODE ptr, byref api as ApiInfo)
 	''   function => function pointer
 	''   array => pointer to the element type
 	''   jmp_buf => jmp_buf ptr (jmp_buf is an array type in C)
-	astVisit(ast, @hlFixSpecialParameters)
+	ast->visit(@hlFixSpecialParameters)
 
 	'' Handle char/string types
 	scope
@@ -3046,8 +3053,8 @@ sub hlGlobal(byval ast as ASTNODE ptr, byref api as ApiInfo)
 	if api.moveaboveoptions then
 		var i = api.moveaboveoptions->head
 		while i
-			hlApplyMoveOption(ast, *i->text, *i->alias)
-			i = i->next
+			hlApplyMoveOption(ast, *i->text, *i->alias_)
+			i = i->nxt
 		wend
 	end if
 
@@ -3068,7 +3075,7 @@ end sub
 '' .bi-file-specific highlevel transformations, intended to run on the
 '' API-specific ASTs in each output .bi file.
 ''
-sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as ApiSpecificBiOptions)
+sub hlFile(byval ast as AstNode ptr, byref api as ApiInfo, byref bioptions as ApiSpecificBiOptions)
 	hl.api = @api
 	hl.need_extern = FALSE
 	hl.stdcalls = 0
@@ -3080,7 +3087,7 @@ sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as Ap
 	'' Add Extern block
 	''  * to preserve identifiers of global variables/procedures
 	''  * to cover the most-used calling convention
-	astVisit(ast, @hlCountCallConvs)
+	ast->visit(@hlCountCallConvs)
 	if hl.need_extern then
 		if hl.stdcalls > hl.cdecls then
 			hl.mostusedcallconv = ASTATTRIB_STDCALL
@@ -3090,7 +3097,7 @@ sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as Ap
 
 		'' Remove the calling convention from all procdecls,
 		'' the Extern block will take over
-		astVisit(ast, @hlHideCallConv)
+		ast->visit(@hlHideCallConv)
 
 		var externblock = @"C"
 		if hl.mostusedcallconv = ASTATTRIB_STDCALL then
@@ -3101,9 +3108,9 @@ sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as Ap
 			end if
 		end if
 
-		assert(ast->class = ASTCLASS_GROUP)
-		astPrepend(ast, astNew(ASTCLASS_EXTERNBLOCKBEGIN, externblock))
-		astAppend(ast, astNew(ASTCLASS_EXTERNBLOCKEND))
+		assert(ast->kind = ASTKIND_GROUP)
+		ast->prepend(astNew(ASTKIND_EXTERNBLOCKBEGIN, externblock))
+		ast->append(astNew(ASTKIND_EXTERNBLOCKEND))
 	end if
 
 	'' If any symbols from this file were renamed, add a rename list at the top
@@ -3111,11 +3118,11 @@ sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as Ap
 	if api.have_renames then
 		var entries = hlBuildRenameList(ast)
 		if entries->head then
-			var renamelist = astNew(ASTCLASS_RENAMELIST, "The following symbols have been renamed:")
-			astAppend(renamelist, entries)
-			astPrepend(ast, renamelist)
+			var renamelist = astNew(ASTKIND_RENAMELIST, "The following symbols have been renamed:")
+			renamelist->append(entries)
+			ast->prepend(renamelist)
 		else
-			astDelete(entries)
+			delete entries
 		end if
 	end if
 
@@ -3130,45 +3137,45 @@ sub hlFile(byval ast as ASTNODE ptr, byref api as ApiInfo, byref bioptions as Ap
 
 	'' Add #includes for "crt/long[double].bi" and "crt/wchar.bi" if the
 	'' binding uses the clong[double]/wchar_t types
-	astVisit(ast, @hlSearchSpecialDtypes)
+	ast->visit(@hlSearchSpecialDtypes)
 	if hl.uses_clongdouble then
-		astPrepend(ast, astNew(ASTCLASS_PPINCLUDE, "crt/longdouble.bi"))
+		ast->prepend(astNew(ASTKIND_PPINCLUDE, "crt/longdouble.bi"))
 	end if
 	if hl.uses_clong then
-		astPrepend(ast, astNew(ASTCLASS_PPINCLUDE, "crt/long.bi"))
+		ast->prepend(astNew(ASTKIND_PPINCLUDE, "crt/long.bi"))
 	end if
 
 	'' Prepend #inclibs/#undefs
 	if bioptions.undefs then
-		astPrepend(ast, bioptions.undefs)
+		ast->prepend(bioptions.undefs)
 		bioptions.undefs = NULL
 	end if
 	if bioptions.inclibs then
-		astPrepend(ast, bioptions.inclibs)
+		ast->prepend(bioptions.inclibs)
 		bioptions.inclibs = NULL
 	end if
 
-	astVisit(ast, @hlTurnWhile0IntoScope)
-	astVisit(ast, @hlSolveOutUnnecessaryScopeBlocks)
-	astVisit(ast, @hlCreateElseIfs)
+	ast->visit(@hlTurnWhile0IntoScope)
+	ast->visit(@hlSolveOutUnnecessaryScopeBlocks)
+	ast->visit(@hlCreateElseIfs)
 end sub
 
-function hlCountDecls(byval ast as ASTNODE ptr) as integer
+function hlCountDecls(byval ast as AstNode ptr) as integer
 	var n = 0
 
 	var i = ast->head
 	while i
-		select case i->class
-		case ASTCLASS_DIVIDER, ASTCLASS_PPINCLUDE, ASTCLASS_PPENDIF, _
-		     ASTCLASS_EXTERNBLOCKBEGIN, ASTCLASS_EXTERNBLOCKEND, _
-		     ASTCLASS_INCLIB, ASTCLASS_PRAGMAONCE, _
-		     ASTCLASS_UNKNOWN, ASTCLASS_RENAMELIST, ASTCLASS_TITLE
+		select case i->kind
+		case ASTKIND_DIVIDER, ASTKIND_PPINCLUDE, ASTKIND_PPENDIF, _
+		     ASTKIND_EXTERNBLOCKBEGIN, ASTKIND_EXTERNBLOCKEND, _
+		     ASTKIND_INCLIB, ASTKIND_PRAGMAONCE, _
+		     ASTKIND_UNKNOWN, ASTKIND_RENAMELIST, ASTKIND_TITLE
 
-		case ASTCLASS_PPIF, ASTCLASS_PPELSEIF, ASTCLASS_PPELSE
+		case ASTKIND_PPIF, ASTKIND_PPELSEIF, ASTKIND_PPELSE
 			n += hlCountDecls(i)
 
-		case ASTCLASS_PPDEFINE
-			if (i->expr = NULL) orelse (i->expr->class <> ASTCLASS_UNKNOWN) then
+		case ASTKIND_PPDEFINE
+			if (i->expr = NULL) orelse (i->expr->kind <> ASTKIND_UNKNOWN) then
 				n += 1
 			end if
 
@@ -3176,16 +3183,16 @@ function hlCountDecls(byval ast as ASTNODE ptr) as integer
 			n += 1
 		end select
 
-		i = i->next
+		i = i->nxt
 	wend
 
 	function = n
 end function
 
-function hlCountTodos(byval n as ASTNODE ptr) as integer
+function hlCountTodos(byval n as AstNode ptr) as integer
 	var count = 0
 
-	if n->class = ASTCLASS_UNKNOWN then
+	if n->kind = ASTKIND_UNKNOWN then
 		count += 1
 	end if
 
@@ -3196,7 +3203,7 @@ function hlCountTodos(byval n as ASTNODE ptr) as integer
 	var i = n->head
 	while i
 		count += hlCountTodos(i)
-		i = i->next
+		i = i->nxt
 	wend
 
 	function = count

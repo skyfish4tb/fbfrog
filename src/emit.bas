@@ -1,6 +1,9 @@
 '' FB code generation, from AST
 
 #include once "emit.bi"
+#include once "emit-fbkeywords.bi"
+#include once "fbfrog.bi"
+#include once "chars.bi"
 
 namespace emit
 
@@ -211,7 +214,7 @@ dim shared as ushort typeToKw(0 to TYPE__COUNT-1) = { _
 	KW_ZSTRING, KW_WSTRING, KW_WCHAR_T _
 }
 
-sub CodeGen.emitType(byval dtype as integer, byval subtype as ASTNODE ptr)
+sub CodeGen.emitType(byval dtype as integer, byval subtype as AstNode ptr)
 	var dt = typeGetDt(dtype)
 	assert(dt <> TYPE_NONE)
 	var ptrcount = typeGetPtrCount(dtype)
@@ -292,23 +295,23 @@ sub CodeGen.emitType(byval dtype as integer, byval subtype as ASTNODE ptr)
 	next
 end sub
 
-sub CodeGen.emitType(byval n as ASTNODE ptr)
+sub CodeGen.emitType(byval n as AstNode ptr)
 	emitType(n->dtype, n->subtype)
 end sub
 
 '' Normally we'll emit Extern blocks, making it unnecessary to worry about
 '' case-preserving aliases, but symbols can still have an explicit alias set due
 '' to symbol renaming.
-sub CodeGen.emitAlias(byval n as ASTNODE ptr)
-	if n->alias then
+sub CodeGen.emitAlias(byval n as AstNode ptr)
+	if n->alias_ then
 		add(TK_SPACE)
 		add(KW_ALIAS)
 		add(TK_SPACE)
-		add(TK_STRLIT, """" + *n->alias + """")
+		add(TK_STRLIT, """" + *n->alias_ + """")
 	end if
 end sub
 
-sub CodeGen.emitIdAndArray(byval n as ASTNODE ptr, byval allow_alias as integer)
+sub CodeGen.emitIdAndArray(byval n as AstNode ptr, byval allow_alias as integer)
 	add(TK_ID, n->text)
 	if n->array then
 		emitExpr(n->array)
@@ -324,11 +327,11 @@ sub CodeGen.emitIdAndArray(byval n as ASTNODE ptr, byval allow_alias as integer)
 	end if
 end sub
 
-sub CodeGen.emitSeparatedList(byval n as ASTNODE ptr, byval skip_head as integer)
+sub CodeGen.emitSeparatedList(byval n as AstNode ptr, byval skip_head as integer)
 	var count = 0
 	var i = n->head
 	if (i <> NULL) and skip_head then
-		i = i->next
+		i = i->nxt
 	end if
 	while i
 		if count > 0 then
@@ -337,17 +340,17 @@ sub CodeGen.emitSeparatedList(byval n as ASTNODE ptr, byval skip_head as integer
 		end if
 		emitExpr(i)
 		count += 1
-		i = i->next
+		i = i->nxt
 	wend
 end sub
 
-sub CodeGen.emitParamList(byval n as ASTNODE ptr, byval skip_head as integer)
+sub CodeGen.emitParamList(byval n as AstNode ptr, byval skip_head as integer)
 	add(TK_LPAREN)
 	emitSeparatedList(n, skip_head)
 	add(TK_RPAREN)
 end sub
 
-sub CodeGen.emitInitializer(byval n as ASTNODE ptr)
+sub CodeGen.emitInitializer(byval n as AstNode ptr)
 	if n->expr then
 		add(TK_SPACE)
 		add(TK_EQ)
@@ -356,7 +359,7 @@ sub CodeGen.emitInitializer(byval n as ASTNODE ptr)
 	end if
 end sub
 
-sub CodeGen.emitProcHeader(byval n as ASTNODE ptr, byval is_expr as integer)
+sub CodeGen.emitProcHeader(byval n as AstNode ptr, byval is_expr as integer)
 	assert(n->array = NULL)
 
 	'' SUB|FUNCTION [<id>]
@@ -403,7 +406,7 @@ sub CodeGen.emitTodoForQuirkKeywordType(byval id as zstring ptr)
 	end if
 end sub
 
-sub CodeGen.emitMacroHeader(byval n as ASTNODE ptr, byval macrokw as ulong)
+sub CodeGen.emitMacroHeader(byval n as AstNode ptr, byval macrokw as ulong)
 	bol()
 	add(TK_HASH)
 	add(macrokw)
@@ -485,19 +488,19 @@ private function renderStrLit(byval payload as const zstring ptr) as string
 	return s
 end function
 
-sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval need_macroparam_parens as integer)
+sub CodeGen.emitExpr(byval n as AstNode ptr, byval need_parens as integer, byval need_macroparam_parens as integer)
 	var consider_parens = FALSE
-	select case as const n->class
-	case ASTCLASS_VEROR, ASTCLASS_VERAND, ASTCLASS_VERNUMCHECK, _
-	     ASTCLASS_LOGOR, ASTCLASS_LOGAND, _
-	     ASTCLASS_OR, ASTCLASS_XOR, ASTCLASS_AND, _
-	     ASTCLASS_EQ, ASTCLASS_NE, ASTCLASS_LT, _
-	     ASTCLASS_LE, ASTCLASS_GT, ASTCLASS_GE, _
-	     ASTCLASS_SHL, ASTCLASS_SHR, _
-	     ASTCLASS_ADD, ASTCLASS_SUB, ASTCLASS_MUL, ASTCLASS_DIV, ASTCLASS_MOD, _
-	     ASTCLASS_NOT, ASTCLASS_NEGATE, ASTCLASS_UNARYPLUS, ASTCLASS_ADDROF, ASTCLASS_DEREF
+	select case as const n->kind
+	case ASTKIND_VEROR, ASTKIND_VERAND, ASTKIND_VERNUMCHECK, _
+	     ASTKIND_LOGOR, ASTKIND_LOGAND, _
+	     ASTKIND_OR, ASTKIND_XOR, ASTKIND_AND, _
+	     ASTKIND_EQ, ASTKIND_NE, ASTKIND_LT, _
+	     ASTKIND_LE, ASTKIND_GT, ASTKIND_GE, _
+	     ASTKIND_SHL, ASTKIND_SHR, _
+	     ASTKIND_ADD, ASTKIND_SUB, ASTKIND_MUL, ASTKIND_DIV, ASTKIND_MOD, _
+	     ASTKIND_NOT, ASTKIND_NEGATE, ASTKIND_UNARYPLUS, ASTKIND_ADDROF, ASTKIND_DEREF
 		consider_parens = TRUE
-	case ASTCLASS_TEXT
+	case ASTKIND_TEXT
 		need_parens = need_macroparam_parens and ((n->attrib and ASTATTRIB_PARENTHESIZEDMACROPARAM) <> 0)
 		consider_parens = TRUE
 	end select
@@ -507,12 +510,12 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 		add(TK_LPAREN)
 	end if
 
-	select case as const n->class
-	case ASTCLASS_VEROR, ASTCLASS_VERAND
+	select case as const n->kind
+	case ASTKIND_VEROR, ASTKIND_VERAND
 		var i = n->head
 		while i
 			emitExpr(i, TRUE)
-			if i->next then
+			if i->nxt then
 				add(TK_SPACE)
 				if astIsVEROR(n) then
 					add(KW_OR)
@@ -521,20 +524,20 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 				end if
 				add(TK_SPACE)
 			end if
-			i = i->next
+			i = i->nxt
 		wend
 
-	case ASTCLASS_VERNUMCHECK
+	case ASTKIND_VERNUMCHECK
 		add(TK_ID, frog.versiondefine)
 		add(TK_SPACE)
 		add(TK_EQ)
 		add(TK_SPACE)
 		add(TK_NUMLIT, frog.vernums(n->vernum))
 
-	case ASTCLASS_PROC
+	case ASTKIND_PROC
 		emitProcHeader(n, TRUE)
 
-	case ASTCLASS_PARAM
+	case ASTKIND_PARAM
 		'' should have been solved out by hExpandArrayTypedef()
 		assert(n->array = NULL)
 
@@ -558,16 +561,16 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 			emitInitializer(n)
 		end if
 
-	case ASTCLASS_ARRAY
+	case ASTKIND_ARRAY
 		emitParamList(n, FALSE)
 
-	case ASTCLASS_MACROPARAM
+	case ASTKIND_MACROPARAM
 		add(TK_ID, n->text)
 		if n->attrib and ASTATTRIB_VARIADIC then
 			add(TK_ELLIPSIS)
 		end if
 
-	case ASTCLASS_CONSTI, ASTCLASS_CONSTF
+	case ASTKIND_CONSTI, ASTKIND_CONSTF
 		var s = hGetFbNumberLiteralPrefix(n->attrib)
 		s += *n->text
 
@@ -602,11 +605,11 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 			add(TK_RPAREN)
 		end if
 
-	case ASTCLASS_TEXT
+	case ASTKIND_TEXT
 		add(iif(strIsValidSymbolId(n->text), TK_ID, TK_TEXT), n->text)
 
-	case ASTCLASS_STRING, ASTCLASS_CHAR
-		if n->class = ASTCLASS_CHAR then
+	case ASTKIND_STRING, ASTKIND_CHAR
+		if n->kind = ASTKIND_CHAR then
 			add(KW_ASC)
 			add(TK_LPAREN)
 		end if
@@ -624,51 +627,51 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 			add(TK_RPAREN)
 		end select
 
-		if n->class = ASTCLASS_CHAR then
+		if n->kind = ASTKIND_CHAR then
 			add(TK_RPAREN)
 		end if
 
-	case ASTCLASS_LOGOR       : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_ORELSE  ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_LOGAND      : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_ANDALSO ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_OR          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_OR      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_XOR         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_XOR     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_AND         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_AND     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_EQ          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_EQ      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_NE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_NE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_LT          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_LT      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_LE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_LE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_GT          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_GT      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_GE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_GE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_SHL         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_SHL     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_SHR         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_SHR     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_ADD         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_PLUS    ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_SUB         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_MINUS   ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_MUL         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_STAR    ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_DIV         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_SLASH   ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_MOD         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_MOD     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
-	case ASTCLASS_INDEX       : emitExpr(n->head, TRUE) :               : add(TK_LBRACKET) :               : emitExpr(n->tail, TRUE) : add(TK_RBRACKET)
-	case ASTCLASS_MEMBER      : emitExpr(n->head, TRUE) :               : add(TK_DOT     ) :               : emitExpr(n->tail, TRUE)
-	case ASTCLASS_MEMBERDEREF : emitExpr(n->head, TRUE) :               : add(TK_ARROW   ) :               : emitExpr(n->tail, TRUE)
-	case ASTCLASS_NOT       : add(KW_NOT  ) : add(TK_SPACE) : emitExpr(n->head, TRUE)
-	case ASTCLASS_NEGATE    : add(TK_MINUS) : emitExpr(n->head, TRUE)
-	case ASTCLASS_UNARYPLUS : add(TK_PLUS ) : emitExpr(n->head, TRUE)
-	case ASTCLASS_ADDROF    : add(TK_AT   ) : emitExpr(n->head, TRUE)
-	case ASTCLASS_DEREF     : add(TK_STAR ) : emitExpr(n->head, TRUE)
-	case ASTCLASS_STRINGIFY : add(TK_HASH ) : emitExpr(n->head)
+	case ASTKIND_LOGOR       : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_ORELSE  ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_LOGAND      : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_ANDALSO ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_OR          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_OR      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_XOR         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_XOR     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_AND         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_AND     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_EQ          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_EQ      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_NE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_NE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_LT          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_LT      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_LE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_LE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_GT          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_GT      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_GE          : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_GE      ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_SHL         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_SHL     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_SHR         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_SHR     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_ADD         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_PLUS    ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_SUB         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_MINUS   ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_MUL         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_STAR    ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_DIV         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(TK_SLASH   ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_MOD         : emitExpr(n->head, TRUE) : add(TK_SPACE) : add(KW_MOD     ) : add(TK_SPACE) : emitExpr(n->tail, TRUE)
+	case ASTKIND_INDEX       : emitExpr(n->head, TRUE) :               : add(TK_LBRACKET) :               : emitExpr(n->tail, TRUE) : add(TK_RBRACKET)
+	case ASTKIND_MEMBER      : emitExpr(n->head, TRUE) :               : add(TK_DOT     ) :               : emitExpr(n->tail, TRUE)
+	case ASTKIND_MEMBERDEREF : emitExpr(n->head, TRUE) :               : add(TK_ARROW   ) :               : emitExpr(n->tail, TRUE)
+	case ASTKIND_NOT       : add(KW_NOT  ) : add(TK_SPACE) : emitExpr(n->head, TRUE)
+	case ASTKIND_NEGATE    : add(TK_MINUS) : emitExpr(n->head, TRUE)
+	case ASTKIND_UNARYPLUS : add(TK_PLUS ) : emitExpr(n->head, TRUE)
+	case ASTKIND_ADDROF    : add(TK_AT   ) : emitExpr(n->head, TRUE)
+	case ASTKIND_DEREF     : add(TK_STAR ) : emitExpr(n->head, TRUE)
+	case ASTKIND_STRINGIFY : add(TK_HASH ) : emitExpr(n->head)
 
-	case ASTCLASS_SIZEOF
+	case ASTKIND_SIZEOF
 		add(KW_SIZEOF)
 		add(TK_LPAREN)
 		emitExpr(n->head, FALSE, FALSE)
 		add(TK_RPAREN)
 
-	case ASTCLASS_DEFINED
+	case ASTKIND_DEFINED
 		add(KW_DEFINED)
 		add(TK_LPAREN)
 		add(TK_ID, n->text)
 		add(TK_RPAREN)
 
-	case ASTCLASS_CAST
+	case ASTKIND_CAST
 		var is_comma_list = FALSE
 		select case n->dtype
 		case TYPE_BYTE     : add(KW_CBYTE   ) : add(TK_LPAREN)
@@ -694,7 +697,7 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 		emitExpr(n->head, FALSE, is_comma_list)
 		add(TK_RPAREN)
 
-	case ASTCLASS_IIF
+	case ASTKIND_IIF
 		add(KW_IIF)
 		add(TK_LPAREN)
 		emitExpr(n->expr)
@@ -706,48 +709,48 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 		emitExpr(n->tail)
 		add(TK_RPAREN)
 
-	case ASTCLASS_STRCAT
+	case ASTKIND_STRCAT
 		var i = n->head
 		while i
 			if i <> n->head then
 				add(TK_SPACE)
 			end if
 			emitExpr(i)
-			i = i->next
+			i = i->nxt
 		wend
 
-	case ASTCLASS_PPMERGE
+	case ASTKIND_PPMERGE
 		var i = n->head
 		while i
 			if i <> n->head then
 				add(TK_HASHHASH)
 			end if
 			emitExpr(i)
-			i = i->next
+			i = i->nxt
 		wend
 
-	case ASTCLASS_CALL
+	case ASTKIND_CALL
 		emitExpr(n->head, TRUE, FALSE)
 		emitParamList(n, TRUE)
 
-	case ASTCLASS_STRUCTINIT
+	case ASTKIND_STRUCTINIT
 		emitParamList(n, FALSE)
 
-	case ASTCLASS_ARRAYINIT
+	case ASTKIND_ARRAYINIT
 		add(TK_LBRACE)
 		emitSeparatedList(n, FALSE)
 		add(TK_RBRACE)
 
-	case ASTCLASS_DIMENSION
+	case ASTKIND_DIMENSION
 		add(TK_NUMLIT, "0")
 		add(TK_SPACE)
 		add(KW_TO)
 		add(TK_SPACE)
-		select case n->expr->class
-		case ASTCLASS_ELLIPSIS
+		select case n->expr->kind
+		case ASTKIND_ELLIPSIS
 			add(TK_ELLIPSIS)
-		case ASTCLASS_CONSTI
-			add(TK_NUMLIT, str(astEvalConstiAsInt64(n->expr) - 1))
+		case ASTKIND_CONSTI
+			add(TK_NUMLIT, str(n->expr->evalConstiAsInt64() - 1))
 		case else
 			emitExpr(n->expr, TRUE)
 			add(TK_SPACE)
@@ -756,14 +759,14 @@ sub CodeGen.emitExpr(byval n as ASTNODE ptr, byval need_parens as integer, byval
 			add(TK_NUMLIT, "1")
 		end select
 
-	case ASTCLASS_DATATYPE
+	case ASTKIND_DATATYPE
 		emitType(n)
 
-	case ASTCLASS_ELLIPSIS
+	case ASTKIND_ELLIPSIS
 		add(TK_ELLIPSIS)
 
 	case else
-		astDump(n)
+		n->dump()
 		assert(FALSE)
 	end select
 
@@ -884,7 +887,7 @@ sub CodeGen.emitLines(byval lines as const zstring ptr)
 	loop
 end sub
 
-sub CodeGen.emitIndentedChildren(byval n as ASTNODE ptr, byval parentclass as integer = -1)
+sub CodeGen.emitIndentedChildren(byval n as AstNode ptr, byval parentkind as integer = -1)
 	if comment > 0 then
 		commentspaces += 4
 	else
@@ -893,8 +896,8 @@ sub CodeGen.emitIndentedChildren(byval n as ASTNODE ptr, byval parentclass as in
 
 	var i = n->head
 	while i
-		emitCode(i, parentclass)
-		i = i->next
+		emitCode(i, parentkind)
+		i = i->nxt
 	wend
 
 	if comment > 0 then
@@ -909,7 +912,7 @@ sub CodeGen.emitVarDecl _
 		byval kw1 as integer, _
 		byval kw2 as integer, _
 		byval spaces as integer, _
-		byval n as ASTNODE ptr, _
+		byval n as AstNode ptr, _
 		byval is_extern as integer _
 	)
 
@@ -948,7 +951,7 @@ sub CodeGen.emitVarDecl _
 	eol()
 end sub
 
-sub CodeGen.emitSelfBop(byval n as ASTNODE ptr, byval op as ulong)
+sub CodeGen.emitSelfBop(byval n as AstNode ptr, byval op as ulong)
 	bol()
 	emitExpr(n->head, TRUE)
 	add(TK_SPACE)
@@ -959,7 +962,7 @@ sub CodeGen.emitSelfBop(byval n as ASTNODE ptr, byval op as ulong)
 	eol()
 end sub
 
-sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
+sub CodeGen.emitCode(byval n as AstNode ptr, byval parentkind as integer)
 	var wrap_in_ifndef = ((n->attrib and ASTATTRIB_IFNDEFDECL) <> 0)
 
 	if wrap_in_ifndef then
@@ -973,21 +976,21 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		indent += 1
 	end if
 
-	select case as const n->class
-	case ASTCLASS_GROUP
+	select case as const n->kind
+	case ASTKIND_GROUP
 		var i = n->head
 		while i
 			emitCode(i)
-			i = i->next
+			i = i->nxt
 		wend
 
-	case ASTCLASS_DIVIDER
-		if (n->prev <> NULL) and (n->next <> NULL) then
+	case ASTKIND_DIVIDER
+		if (n->prev <> NULL) and (n->nxt <> NULL) then
 			bol()
 			eol()
 		end if
 
-	case ASTCLASS_SCOPEBLOCK
+	case ASTKIND_SCOPEBLOCK
 		bol()
 		add(KW_SCOPE)
 		eol()
@@ -1000,17 +1003,17 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(KW_SCOPE)
 		eol()
 
-	case ASTCLASS_UNKNOWN
+	case ASTKIND_UNKNOWN
 		comment += 1
 		commentspaces += 1
 		emitLines("TODO: " + *n->text)
 		commentspaces -= 1
 		comment -= 1
 
-	case ASTCLASS_FBCODE
+	case ASTKIND_FBCODE
 		emitLines(n->text)
 
-	case ASTCLASS_RENAMELIST
+	case ASTKIND_RENAMELIST
 		var added_indent = FALSE
 		if comment = 0 then
 			added_indent = TRUE
@@ -1024,7 +1027,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			comment -= 1
 		end if
 
-	case ASTCLASS_INCLIB
+	case ASTKIND_INCLIB
 		bol()
 		add(TK_HASH)
 		add(KW_INCLIB)
@@ -1032,7 +1035,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(TK_STRLIT, """" + *n->text + """")
 		eol()
 
-	case ASTCLASS_UNDEF
+	case ASTKIND_UNDEF
 		bol()
 		add(TK_HASH)
 		add(KW_UNDEF)
@@ -1040,7 +1043,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(TK_ID, n->text)
 		eol()
 
-	case ASTCLASS_PRAGMAONCE
+	case ASTKIND_PRAGMAONCE
 		bol()
 		add(TK_HASH)
 		add(KW_PRAGMA)
@@ -1048,7 +1051,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(KW_ONCE)
 		eol()
 
-	case ASTCLASS_PPINCLUDE
+	case ASTKIND_PPINCLUDE
 		bol()
 		add(TK_HASH)
 		add(KW_INCLUDE)
@@ -1058,10 +1061,10 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(TK_STRLIT, """" + *n->text + """")
 		eol()
 
-	case ASTCLASS_PPDEFINE
+	case ASTKIND_PPDEFINE
 		if n->expr then
-			if astIsCodeScopeBlock(n->expr) then
-				if astIsScopeBlockWith1Stmt(n->expr) then
+			if n->expr->isCodeScopeBlock() then
+				if n->expr->isScopeBlockWith1Stmt() then
 					'' Emit macro body with scope block in single-line #define
 					emitMacroHeader(n, KW_DEFINE)
 					eolSingleLineBegin()
@@ -1088,21 +1091,21 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			eol()
 		end if
 
-	case ASTCLASS_PPIF
+	case ASTKIND_PPIF
 		bol()
 		add(TK_HASH)
 
 		assert(n->expr)
-		select case n->expr->class
+		select case n->expr->kind
 		'' #if defined(id)        ->    #ifdef id
-		case ASTCLASS_DEFINED
+		case ASTKIND_DEFINED
 			add(KW_IFDEF)
 			add(TK_SPACE)
 			add(TK_ID, n->expr->text)
 
 		'' #if not defined(id)    ->    #ifndef id
-		case ASTCLASS_NOT
-			if n->expr->head->class = ASTCLASS_DEFINED then
+		case ASTKIND_NOT
+			if n->expr->head->kind = ASTKIND_DEFINED then
 				add(KW_IFNDEF)
 				add(TK_SPACE)
 				add(TK_ID, n->expr->head->text)
@@ -1120,7 +1123,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 
 		emitIndentedChildren(n)
 
-	case ASTCLASS_PPELSEIF
+	case ASTKIND_PPELSEIF
 		bol()
 		add(TK_HASH)
 		add(KW_ELSEIF)
@@ -1129,21 +1132,21 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		eol()
 		emitIndentedChildren(n)
 
-	case ASTCLASS_PPELSE
+	case ASTKIND_PPELSE
 		bol()
 		add(TK_HASH)
 		add(KW_ELSE)
 		eol()
 		emitIndentedChildren(n)
 
-	case ASTCLASS_PPENDIF
+	case ASTKIND_PPENDIF
 		bol()
 		add(TK_HASH)
 		add(KW_ENDIF)
 		eol()
 
-	case ASTCLASS_STRUCT, ASTCLASS_UNION, ASTCLASS_ENUM
-		if (n->class = ASTCLASS_ENUM) and (n->text <> NULL) then
+	case ASTKIND_STRUCT, ASTKIND_UNION, ASTKIND_ENUM
+		if (n->kind = ASTKIND_ENUM) and (n->text <> NULL) then
 			bol()
 			add(KW_TYPE)
 			add(TK_SPACE)
@@ -1160,9 +1163,9 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		'' insert a union/struct in between respectively, to make it
 		'' FB-compatible. FB only allows alternating types/unions when
 		'' nesting.
-		var opposite = iif(n->class = ASTCLASS_STRUCT, KW_UNION, KW_TYPE)
-		if n->class = parentclass then
-			assert(parentclass <> ASTCLASS_ENUM)
+		var opposite = iif(n->kind = ASTKIND_STRUCT, KW_UNION, KW_TYPE)
+		if n->kind = parentkind then
+			assert(parentkind <> ASTKIND_ENUM)
 			bol()
 			add(opposite)
 			eol()
@@ -1170,14 +1173,14 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		end if
 
 		var compound = KW_TYPE
-		select case n->class
-		case ASTCLASS_UNION : compound = KW_UNION
-		case ASTCLASS_ENUM  : compound = KW_ENUM
+		select case n->kind
+		case ASTKIND_UNION : compound = KW_UNION
+		case ASTKIND_ENUM  : compound = KW_ENUM
 		end select
 
 		bol()
 		add(compound)
-		if (n->class <> ASTCLASS_ENUM) and (n->text <> NULL) then
+		if (n->kind <> ASTKIND_ENUM) and (n->text <> NULL) then
 			add(TK_SPACE)
 			add(TK_ID, n->text)
 		end if
@@ -1195,12 +1198,12 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			add(TK_SPACE)
 			add(TK_NUMLIT, str(fieldalign))
 		end if
-		if (n->class <> ASTCLASS_ENUM) and (n->text <> NULL) then
+		if (n->kind <> ASTKIND_ENUM) and (n->text <> NULL) then
 			emitTodoForQuirkKeywordType(n->text)
 		end if
 		eol()
 
-		emitIndentedChildren(n, n->class)
+		emitIndentedChildren(n, n->kind)
 
 		bol()
 		add(KW_END)
@@ -1208,7 +1211,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(compound)
 		eol()
 
-		if n->class = parentclass then
+		if n->kind = parentkind then
 			indent -= 1
 			bol()
 			add(KW_END)
@@ -1217,7 +1220,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			eol()
 		end if
 
-	case ASTCLASS_TYPEDEF
+	case ASTKIND_TYPEDEF
 		assert(n->array = NULL)
 		bol()
 		add(KW_TYPE)
@@ -1230,7 +1233,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		emitTodoForQuirkKeywordType(n->text)
 		eol()
 
-	case ASTCLASS_CONST
+	case ASTKIND_CONST
 		bol()
 		if (n->attrib and ASTATTRIB_ENUMCONST) = 0 then
 			add(KW_CONST)
@@ -1240,7 +1243,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		emitInitializer(n)
 		eol()
 
-	case ASTCLASS_VAR
+	case ASTKIND_VAR
 		if n->attrib and ASTATTRIB_LOCAL then
 			if n->attrib and ASTATTRIB_STATIC then
 				emitVarDecl(KW_STATIC, -1, 0, n, FALSE)
@@ -1258,7 +1261,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			end if
 		end if
 
-	case ASTCLASS_FIELD
+	case ASTKIND_FIELD
 		'' Fields can be named after keywords, but we have to do
 		''     as type foo
 		'' instead of
@@ -1288,7 +1291,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		end if
 		eol()
 
-	case ASTCLASS_PROC
+	case ASTKIND_PROC
 		bol()
 		if n->expr then
 			add(KW_PRIVATE) '' procedure bodies in headers should really be private
@@ -1301,7 +1304,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 
 		'' Body
 		if n->expr then
-			assert(n->expr->class = ASTCLASS_SCOPEBLOCK)
+			assert(n->expr->kind = ASTKIND_SCOPEBLOCK)
 			emitIndentedChildren(n->expr)
 			bol()
 			add(KW_END)
@@ -1310,21 +1313,21 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 			eol()
 		end if
 
-	case ASTCLASS_EXTERNBLOCKBEGIN
+	case ASTKIND_EXTERNBLOCKBEGIN
 		bol()
 		add(KW_EXTERN)
 		add(TK_SPACE)
 		add(TK_STRLIT, """" + *n->text + """")
 		eol()
 
-	case ASTCLASS_EXTERNBLOCKEND
+	case ASTKIND_EXTERNBLOCKEND
 		bol()
 		add(KW_END)
 		add(TK_SPACE)
 		add(KW_EXTERN)
 		eol()
 
-	case ASTCLASS_RETURN
+	case ASTKIND_RETURN
 		bol()
 		add(KW_RETURN)
 		if n->head then
@@ -1333,7 +1336,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		end if
 		eol()
 
-	case ASTCLASS_ASSIGN
+	case ASTKIND_ASSIGN
 		bol()
 		emitExpr(n->head, TRUE)
 		add(TK_SPACE)
@@ -1341,21 +1344,21 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(TK_SPACE)
 		emitExpr(n->tail, FALSE)
 		eol()
-	case ASTCLASS_SELFOR  : emitSelfBop(n, KW_OR)
-	case ASTCLASS_SELFXOR : emitSelfBop(n, KW_XOR)
-	case ASTCLASS_SELFAND : emitSelfBop(n, KW_AND)
-	case ASTCLASS_SELFSHL : emitSelfBop(n, KW_SHL)
-	case ASTCLASS_SELFSHR : emitSelfBop(n, KW_SHR)
-	case ASTCLASS_SELFADD : emitSelfBop(n, TK_PLUS)
-	case ASTCLASS_SELFSUB : emitSelfBop(n, TK_MINUS)
-	case ASTCLASS_SELFMUL : emitSelfBop(n, TK_STAR)
-	case ASTCLASS_SELFDIV : emitSelfBop(n, TK_SLASH)
-	case ASTCLASS_SELFMOD : emitSelfBop(n, KW_MOD)
+	case ASTKIND_SELFOR  : emitSelfBop(n, KW_OR)
+	case ASTKIND_SELFXOR : emitSelfBop(n, KW_XOR)
+	case ASTKIND_SELFAND : emitSelfBop(n, KW_AND)
+	case ASTKIND_SELFSHL : emitSelfBop(n, KW_SHL)
+	case ASTKIND_SELFSHR : emitSelfBop(n, KW_SHR)
+	case ASTKIND_SELFADD : emitSelfBop(n, TK_PLUS)
+	case ASTKIND_SELFSUB : emitSelfBop(n, TK_MINUS)
+	case ASTKIND_SELFMUL : emitSelfBop(n, TK_STAR)
+	case ASTKIND_SELFDIV : emitSelfBop(n, TK_SLASH)
+	case ASTKIND_SELFMOD : emitSelfBop(n, KW_MOD)
 
-	case ASTCLASS_IFBLOCK
+	case ASTKIND_IFBLOCK
 		var i = n->head
 
-		assert(i->class = ASTCLASS_IFPART)
+		assert(i->kind = ASTKIND_IFPART)
 		bol()
 		add(KW_IF)
 		add(TK_SPACE)
@@ -1366,10 +1369,10 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		emitIndentedChildren(i)
 
 		do
-			i = i->next
+			i = i->nxt
 			if i = NULL then exit do
 
-			if i->class = ASTCLASS_ELSEIFPART then
+			if i->kind = ASTKIND_ELSEIFPART then
 				bol()
 				add(KW_ELSEIF)
 				add(TK_SPACE)
@@ -1379,7 +1382,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 				eol()
 				emitIndentedChildren(i)
 			else
-				assert(i->class = ASTCLASS_ELSEPART)
+				assert(i->kind = ASTKIND_ELSEPART)
 				bol()
 				add(KW_ELSE)
 				eol()
@@ -1393,7 +1396,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		add(KW_IF)
 		eol()
 
-	case ASTCLASS_DOWHILE
+	case ASTKIND_DOWHILE
 		bol()
 		add(KW_DO)
 		eol()
@@ -1408,7 +1411,7 @@ sub CodeGen.emitCode(byval n as ASTNODE ptr, byval parentclass as integer)
 		emitExpr(n->expr)
 		eol()
 
-	case ASTCLASS_WHILE
+	case ASTKIND_WHILE
 		bol()
 		add(KW_WHILE)
 		add(TK_SPACE)
@@ -1499,7 +1502,7 @@ end sub
 
 end namespace
 
-function emitFbType(byval dtype as integer, byval subtype as ASTNODE ptr) as string
+function emitFbType(byval dtype as integer, byval subtype as AstNode ptr) as string
 	dim fbcode as emit.CodeGen
 	fbcode.emitType(dtype, subtype)
 	dim w as emit.StringWriter
@@ -1507,7 +1510,7 @@ function emitFbType(byval dtype as integer, byval subtype as ASTNODE ptr) as str
 	return w.s
 end function
 
-function emitFbExpr(byval n as ASTNODE ptr) as string
+function emitFbExpr(byval n as AstNode ptr) as string
 	dim fbcode as emit.CodeGen
 	fbcode.emitExpr(n)
 	dim w as emit.StringWriter
@@ -1515,7 +1518,7 @@ function emitFbExpr(byval n as ASTNODE ptr) as string
 	return w.s
 end function
 
-sub emitFbFile(byref filename as string, byval header as HeaderInfo ptr, byval ast as ASTNODE ptr)
+sub emitFbFile(byref filename as string, byval header as HeaderInfo ptr, byval ast as AstNode ptr)
 	dim fbcode as emit.CodeGen
 	if header then
 		fbcode.emitHeader(*header)
@@ -1525,7 +1528,7 @@ sub emitFbFile(byref filename as string, byval header as HeaderInfo ptr, byval a
 	w.render(fbcode.tokens)
 end sub
 
-sub emitFbStdout(byval ast as ASTNODE ptr, byval baseindent as integer)
+sub emitFbStdout(byval ast as AstNode ptr, byval baseindent as integer)
 	dim fbcode as emit.CodeGen
 	fbcode.indent += baseindent
 	fbcode.emitCode(ast)
