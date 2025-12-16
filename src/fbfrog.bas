@@ -206,8 +206,15 @@ private function hFindResource(byref filename as string) as string
 	var found = dir1 + filename
 	if fileexists(found) then return found
 
-	'' 4. <exepath>/../include/fbfrog/?
-	var dir2 = hExepath() + ".." + PATHDIV + INCLUDEDIR
+	#ifdef ENABLE_STANDALONE
+		'' 4. <exepath>/fbfrog/include/?
+		const ALTINCLUDEDIR = "fbfrog" + PATHDIV + "include" + PATHDIV
+		var dir2 = hExepath() + ALTINCLUDEDIR
+	#else
+		'' 4. <exepath>/../include/fbfrog/?
+		var dir2 = hExepath() + ".." + PATHDIV + INCLUDEDIR
+	#endif
+
 	found = dir2 + filename
 	if fileexists(found) then return found
 
@@ -215,12 +222,16 @@ private function hFindResource(byref filename as string) as string
 	print "search dirs:"
 	print "  <curdir> (" + curdir() + ")"
 	print "  <exepath>/include/fbfrog (" + dir1 + ")"
-	print "  <exepath>/../include/fbfrog (" + pathNormalize(dir2) + ")"
+	#ifdef ENABLE_STANDALONE
+		print "  <exepath>/fbfrog/include (" + dir2 + ")"
+	#else
+		print "  <exepath>/../include/fbfrog (" + pathNormalize(dir2) + ")"
+	#endif
 	end 1
 end function
 
 private sub hPrintHelpAndExit()
-	print "fbfrog 1.14 (built on " + __DATE_ISO__ + ")"
+	print "fbfrog 1.15 (built on " + __DATE_ISO__ + ")"
 	print "Usage: fbfrog foo.h [options]"
 	print "Common options:"
 	print "  -o <path/file>     Set output directory and/or file name"
@@ -243,10 +254,33 @@ private function hTurnArgsIntoString(byval argc as integer, byval argv as zstrin
 		'' If the argument contains special chars (white-space, ", '),
 		'' enclose it in quotes as needed for lexLoadArgs().
 
+		#if defined(__FB_WIN32__) or defined(__FB_DOS__)
+			'' WIN32_HACKS
+			'' assume that if ^* was passed in, it was to escape the
+			'' asterick and prevent wildcard expansion
+			arg = strReplace(arg, $"^*", $"*")
+		#endif
+
 		'' Contains '?
 		if instr(arg, "'") > 0 then
 			'' Must enclose in "..." and escape included " or \ chars properly.
 			'' This also works if " or whitespace are included too.
+
+			#if defined(__FB_WIN32__) or defined(__FB_DOS__)
+				'' WIN32_HACKS
+				'' if there is exactly 2 single quotes at the start and end
+				'' then we probably want to just strip those off since the
+				'' shell didn't do it and we probably are passing something
+				'' like '*' or '*/filename' to prevent wildcard expansion
+
+				if arg = "''" then
+					arg = """"""
+				elseif len( arg ) > 2 then
+					if left( arg, 1 ) = "'" and right( arg, 1 ) = "'" then
+						arg = mid( arg, 2, len( arg ) - 2 )
+					end if
+				end if
+			#endif
 
 			'' Insert \\ for \ before inserting \" for ", so \" won't accidentally
 			'' be turned into \\".
@@ -288,9 +322,10 @@ private sub hLoadArgsFile _
 
 	filename = hFindResource(filename)
 
+	filename = pathNormalizePathDiv(filename)
+
 	'' Load the file content at the specified position
-	var file = filebuffersAdd(frog.sourcectx, filename, location)
-	lexLoadArgs(tk, x, file->buffer, file->source)
+	lexLoadArgs(frog.sourcectx, tk, x, frog.sourcectx.addFileSource(filename, location))
 	filecount += 1
 
 end sub
@@ -314,8 +349,9 @@ private sub hExpandArgsFiles(byref tk as TokenBuffer)
 			'' If the @file argument comes from an @file,
 			'' open it relative to the parent @file's dir.
 			var location = tk.getLocation(x)
-			if location.source->is_file then
-				filename = pathAddDiv(pathOnly(location.source->name)) + filename
+			var decodedloc = frog.sourcectx.decode(location)
+			if decodedloc.source->is_file then
+				filename = pathAddDiv(pathOnly(*decodedloc.source->name)) + filename
 			end if
 
 			'' Load the file content behind the @file token
@@ -354,9 +390,9 @@ private function hPathRelativeToArgsFile(byref tk as TokenBuffer, byval x as int
 	'' If the file/dir argument isn't an absolute path, and it came from an
 	'' @file, open it relative to the @file's dir.
 	if pathIsAbsolute(path) = FALSE then
-		var location = tk.getLocation(x)
-		if location.source->is_file then
-			path = pathAddDiv(pathOnly(location.source->name)) + path
+		var decodedloc = frog.sourcectx.decode(tk.getLocation(x))
+		if decodedloc.source->is_file then
+			path = pathAddDiv(pathOnly(*decodedloc.source->name)) + path
 		end if
 	end if
 
@@ -470,11 +506,24 @@ private sub hParseIfCompound(byref tk as TokenBuffer, byref x as integer)
 	loop
 end sub
 
+private function hMaybeJoinOutputPath( byref filename as const string ) as string
+	function = filename
+	'' if the filename is relative and an output path was set
+	'' then join the the output path to the bi file to be emitted
+	if len(frog.outname) <> 0 then
+		if not pathIsAbsolute(frog.outname) then
+			if pathIsDir(frog.outname) then
+				function = pathAddDiv(frog.outname)+filename
+			end if
+		end if
+	end if
+end function
+
 private sub hParseDestinationBiFile(byref tk as TokenBuffer, byref x as integer)
 	'' [<destination .bi file>]
 	if hIsStringOrId(tk, x) then
 		assert(frog.script->tail->kind = ASTKIND_OPTION)
-		frog.script->tail->setAlias(tk.getText(x))
+		frog.script->tail->setAlias(hMaybeJoinOutputPath(*tk.getText(x)))
 		x += 1
 	end if
 end sub
@@ -525,7 +574,7 @@ private sub hParseArgs(byref tk as TokenBuffer, byref x as integer)
 			x += 1
 
 			hExpectStringOrId(tk, x, "<file> argument")
-			var filename = *tk.getText(x)
+			var filename = hMaybeJoinOutputPath(*tk.getText(x))
 			x += 1
 
 			frogAddBi(filename, pattern)
@@ -608,17 +657,17 @@ private sub hParseArgs(byref tk as TokenBuffer, byref x as integer)
 
 			'' original-license.txt
 			hParseParam(tk, x, "original-license.txt parameter for -title")
-			var licensefile = filebuffersAdd(frog.sourcectx, tk.getText(x - 1), tk.getLocation(x - 1))
+			var licensefile = frog.sourcectx.addFileSource(tk.getText(x - 1), tk.getLocation(x - 1))
 
 			'' translators.txt
 			hParseParam(tk, x, "translators.txt parameter for -title")
-			var translatorsfile = filebuffersAdd(frog.sourcectx, tk.getText(x - 1), tk.getLocation(x - 1))
+			var translatorsfile = frog.sourcectx.addFileSource(tk.getText(x - 1), tk.getLocation(x - 1))
 
 			'' [<destination .bi file>]
 			dim header as HeaderInfo ptr
 			if hIsStringOrId(tk, x) then
 				'' .bi-specific -title option
-				var bi = frogLookupBiFromBi(*tk.getText(x))
+				var bi = frogLookupBiFromBi(hMaybeJoinOutputPath(*tk.getText(x)))
 				if bi < 0 then
 					tk.showErrorAndAbort(x, "unknown destination .bi")
 				end if
@@ -987,7 +1036,7 @@ private sub frogEvaluateScript _
 						'' <versionnumber>
 						var vernum = frogLookupVernum(*i->text)
 						if vernum < 0 then
-							oopsLocation(i->location, "unknown version number; it didn't appear in the previous -declareversions option")
+							oopsLocation(frog.sourcectx.decode(i->location), "unknown version number; it didn't appear in the previous -declareversions option")
 						end if
 						condition = astNewVERNUMCHECK(vernum)
 					else
@@ -1069,11 +1118,11 @@ private function frogParse(byref api as ApiInfo) as AstNode ptr
 	dim ast as AstNode ptr
 
 	scope
-		dim tk as TokenBuffer
+		dim tk as TokenBuffer = TokenBuffer(@frog.sourcectx)
 
 		scope
 			'' C preprocessing
-			dim cpp as CppContext = CppContext(frog.sourcectx, tk, api)
+			dim cpp as CppContext = CppContext(@frog.sourcectx, @tk, api)
 
 			'' Add fbfrog's CPP pre-#defines for preprocessing of default.h
 			cpp.addTargetPredefines(api.target)
@@ -1106,9 +1155,9 @@ private function frogParse(byref api as ApiInfo) as AstNode ptr
 					assert(i->kind = ASTKIND_OPTION)
 					if i->opt = OPT_FBFROGINCLUDE then
 						var filename = hFindResource(*i->text)
+						filename = pathNormalizePathDiv(filename)
 						var x = tk.count()
-						var file = filebuffersAdd(frog.sourcectx, filename, type(NULL, 0))
-						lexLoadC(tk, x, file->buffer, file->source)
+						lexLoadC(frog.sourcectx, tk, x, frog.sourcectx.addFileSource(filename, i->location))
 						tk.setRemove(x, tk.count() - 1)
 					end if
 					i = i->nxt
@@ -1204,11 +1253,10 @@ end function
 	frogSetTargets(TRUE)
 
 	scope
-		dim tk as TokenBuffer
+		dim tk as TokenBuffer = TokenBuffer(@frog.sourcectx)
 
 		'' Load all command line arguments into the tk buffer
-		lexLoadArgs(tk, 0, hTurnArgsIntoString(__FB_ARGC__, __FB_ARGV__), _
-			frog.sourcectx.lookupOrMakeSourceInfo("<command line>", FALSE))
+		lexLoadArgs(frog.sourcectx, tk, 0, frog.sourcectx.addInternalSource("command line", hTurnArgsIntoString(__FB_ARGC__, __FB_ARGV__)))
 
 		'' Load content of @files too
 		hExpandArgsFiles(tk)
@@ -1322,16 +1370,17 @@ end function
 			while i
 				var nxt = i->nxt
 
-				assert(i->location.source)
-				assert(i->location.source->is_file)
+				var decodedloc = frog.sourcectx.decode(i->location)
+				assert(decodedloc.source)
+				assert(decodedloc.source->is_file)
 
-				'' Find out into which .bi file this declaration should be put.
+				'' Find out into which .bi file this declaration should be put into.
 				'' If this declaration has the same source as the previous one,
 				'' then re-use the previously calculated .bi file, instead of
 				'' redoing the lookup. Otherwise, do the lookup and cache the result.
-				if prevsource <> i->location.source then
-					bi = frogLookupBiFromH(i->location.source->name)
-					prevsource = i->location.source
+				if prevsource <> decodedloc.source then
+					bi = frogLookupBiFromH(decodedloc.source->name)
+					prevsource = decodedloc.source
 				end if
 
 				if bi >= 0 then

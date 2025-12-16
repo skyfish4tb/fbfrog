@@ -1,5 +1,4 @@
-#include once "c-lex.bi"
-#include once "util-str.bi"
+#include once "lex.bi"
 
 sub LexContext.initKeywords(byval first as integer, byval last as integer)
 	for i as integer = first to last
@@ -22,7 +21,7 @@ sub LexContext.showErrorAndAbort(byref message as string)
 end sub
 
 sub LexContext.setLocation(byval flags as integer = 0)
-	tk->setLocation(x, location)
+	tk->setLocation(x, sourcectx->encode(location))
 	if behindspace then
 		flags or= TKFLAG_BEHINDSPACE
 	end if

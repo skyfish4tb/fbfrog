@@ -1,6 +1,8 @@
 #include once "util-str.bi"
+
 #include once "chars.bi"
 #include once "crt.bi"
+#include once "util.bi"
 
 function hTrim(byref s as string) as string
 	function = trim(s, any !" \t")
@@ -17,6 +19,9 @@ end function
 function strDuplicate(byval s as const zstring ptr) as zstring ptr
 	if s then
 		dim as zstring ptr p = callocate(len(*s) + 1)
+		if p = NULL then
+			oops("strDuplicate() memory allocation failed")
+		end if
 		*p = *s
 		function = p
 	else
@@ -37,12 +42,12 @@ end sub
 
 function strReplace _
 	( _
-		byref text as string, _
+		byref text as const string, _
 		byref a as string, _
 		byref b as string _
 	) as string
 
-	var result = text
+	dim result as string = text
 
 	var alen = len(a)
 	var blen = len(b)
@@ -134,6 +139,9 @@ function strIsValidSymbolId(byval s as const zstring ptr) as integer
 end function
 
 function strIsNumber(byref s as string) as integer
+	if len(s) = 0 then
+		return FALSE
+	end if
 	for i as integer = 0 to len(s) - 1
 		if (s[i] < CH_0) or (s[i] > CH_9) then
 			exit function
@@ -175,6 +183,18 @@ function strMatch(byref s as const string, byref pattern as const string) as int
 	case "?", left(s, 1)
 		'' Current char matches; now check the rest.
 		return strMatch(right(s, len(s) - 1), right(pattern, len(pattern) - 1))
+
+#if defined(__FB_WIN32__) or defined(__FB_DOS__)
+	case "\"
+		return left(s,1) = "/" andalso _
+		       strMatch(right(s, len(s) - 1), right(pattern, len(pattern) - 1))
+
+	case "/"
+		return left(s,1) = "\" andalso _
+		       strMatch(right(s, len(s) - 1), right(pattern, len(pattern) - 1))
+
+#endif
+
 	end select
 
 	function = FALSE
@@ -227,6 +247,9 @@ sub StringMatcher.addChild(byval nodekind as integer, byval text as const ubyte 
 		.nodekind = nodekind
 		if text then
 			.text = allocate(textlength + 1)
+			if .text = NULL then
+				oops("StringMatcher memory allocation failed")
+			end if
 			memcpy(.text, text, textlength)
 			.text[textlength] = 0
 			.textlength = textlength

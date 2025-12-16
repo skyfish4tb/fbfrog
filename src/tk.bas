@@ -9,7 +9,9 @@
 ''
 
 #include once "tk.bi"
+
 #include once "util-str.bi"
+#include once "util.bi"
 
 #include once "crt.bi"
 
@@ -230,7 +232,8 @@ end function
 
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-constructor TokenBuffer()
+constructor TokenBuffer(byval sourcectx as SourceContext ptr)
+	this.sourcectx = sourcectx
 	newgapsize = 1 shl 12
 end constructor
 
@@ -240,7 +243,7 @@ destructor TokenBuffer()
 end destructor
 
 '' Static EOF token for out-of-bounds accesses
-dim shared EOF_TOKEN as ONETOKEN = (TK_EOF)
+dim shared EOF_TOKEN as ONETOKEN = (NULL, type<TkLocation>(0), TK_EOF, 0)
 
 function TokenBuffer.lookup(byval x as integer) as ONETOKEN ptr
 	'' Inside end?
@@ -285,7 +288,7 @@ function TokenBuffer.dumpOne(byval x as integer) as string
 	checkFlag(DIRECTIVE)
 	checkFlag(EXPANSION)
 
-	's += " " + hDumpLocation(@p->location)
+	s += " " + sourcectx->dump(p->location)
 
 	function = s
 end function
@@ -336,6 +339,9 @@ sub TokenBuffer.insert(byval x as integer, byval id as integer, byval text as zs
 		'' end of the new buffer, so that the gap in the middle grows.
 		newgapsize shl= 1
 		buffer = reallocate(buffer, (size + newgapsize) * sizeof(ONETOKEN))
+		if buffer = NULL then
+			oops("tk buffer memory allocation failed")
+		end if
 		p = buffer + front
 		if size > front then
 			memmove(p + newgapsize, p + gap, _
@@ -768,7 +774,7 @@ function TokenBuffer.report(byval x as integer, byval message as zstring ptr) as
 	if get(x) = TK_END   then x -= 1
 	if get(x) = TK_BEGIN then x -= 1
 
-	function = hReport(getLocation(x), message) + reportConstructTokens(x, first, last)
+	function = hReport(sourcectx->decode(getLocation(x)), message) + reportConstructTokens(x, first, last)
 end function
 
 sub TokenBuffer.showErrorAndAbort(byval x as integer, byval message as zstring ptr)

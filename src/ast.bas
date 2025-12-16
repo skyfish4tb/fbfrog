@@ -1,7 +1,11 @@
 '' AST build up/helper functions
 
-#include once "fbfrog.bi"
+#include once "ast.bi"
+
 #include once "emit.bi"
+#include once "tk.bi"
+#include once "util-str.bi"
+#include once "util.bi"
 
 '' Merge/expand dtype b into dtype a, overwriting a's base dtype, but preserving its ptrs/consts
 '' This is useful for expanding typedefs into the context of another dtype.
@@ -232,6 +236,9 @@ dim shared as zstring ptr astnodename(0 to ...) => _
 
 function astNew overload(byval kind as integer) as AstNode ptr
 	var n = new AstNode
+	if n = NULL then
+		oops("AstNode memory allocation failed")
+	end if
 	n->kind = kind
 	function = n
 end function
@@ -597,12 +604,15 @@ sub AstNode.copyOrigId(byval src as AstNode ptr)
 end sub
 
 sub AstNode.setType(byval dtype as integer, byval subtype as AstNode ptr)
-	delete this.subtype
+	'' The new subtype may be a child node of the old,
+	'' so the new must be cloned before the old is deleted.
+	var oldsubtype = this.subtype
 	this.subtype = NULL
 	this.dtype = dtype
 	if subtype then
 		this.subtype = subtype->clone()
 	end if
+	delete oldsubtype
 end sub
 
 function AstNode.cloneNode() as AstNode ptr
@@ -789,8 +799,7 @@ function astIsEqual _
 	'' Only check location if not merging: for merging, the source location doesn't matter.
 	'' We only use it before the merging step.
 	if is_merge = FALSE then
-		if a->location.source  <> b->location.source  then exit function
-		if a->location.linenum <> b->location.linenum then exit function
+		if a->location.value <> b->location.value then exit function
 	end if
 
 	select case a->kind
